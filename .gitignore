@@ -1,0 +1,6 @@
+.env
+memory.db
+chroma_memory/
+__pycache__/
+*.mp3
+*.mp4

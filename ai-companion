@@ -1,0 +1,4 @@
+cd ~
+npm create vite@latest ai-companion -- --template react
+cd ai-companion
+npm install
