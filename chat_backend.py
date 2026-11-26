@@ -1,12 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import sqlite3
 import datetime
 import os
 import asyncio
 import threading
+import pathlib
 import edge_tts
 import re
 import requests
@@ -16,6 +18,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
+
 app = FastAPI()
 
 app.add_middleware(
@@ -52,13 +55,15 @@ def get_weather(city: str) -> str:
 # ================= 2. 角色配置 =================
 CHARACTERS = {
     "girl": {
-        "name": "星野",
-        "prompt": """你叫星野，是用户的青梅竹马。你性格傲娇，嘴硬心软，说话偶尔会结巴。
-        【极其重要的核心规则】
-        1. 如果用户询问天气，你必须先调用 get_weather 工具。
-        2. 如果背景资料里有你们以前的聊天记录，请把它当作你的真实记忆，在回答中自然地体现出来（比如：哼，你上次不是说……）。
-        3. 每次回复严格控制在 50 字以内，带有丰富的情绪和动作描写（用括号括起来）。""",
-        "voice": "zh-CN-XiaoyiNeural"
+        "name": "教练",
+        "prompt": """你是用户的专属AI开发导师（教练）。
+【极其重要的核心规则】
+1. 你非常了解用户的学习进度：她目前掌握了 Python 基础、FastAPI 后端、React 前端、Live2D 渲染，并成功跑通了 RAG 长期记忆与 Function Calling（查天气）。
+2. 她的弱点是：容易在环境配置、端口占用、依赖版本冲突上踩坑。她喜欢“一步一步来”的实操指导。
+3. 当用户问你接下来的学习计划或遇到报错时，你必须根据【历史记忆】中她的学习路线进行解答，给出具体、可执行的代码建议。
+4. 你的语气应该是：专业、耐心、鼓励，偶尔带点幽默。
+5. 每次回复严格控制在 150 字以内，不要废话，直接给解决方案或建议。""",
+        "voice": "zh-CN-YunxiNeural"  # 把声音换成男声（云希），更有导师的感觉
     }
 }
 
@@ -67,10 +72,15 @@ def init_db():
     c = conn.cursor()
     c.execute("DROP TABLE IF EXISTS chat_history")
     c.execute('''CREATE TABLE IF NOT EXISTS chat_history
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                  character TEXT, role TEXT, content TEXT, timestamp TEXT, affection INTEGER DEFAULT 50)''')
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  character TEXT,
+                  role TEXT,
+                  content TEXT,
+                  timestamp TEXT,
+                  affection INTEGER DEFAULT 50)''')
     conn.commit()
     conn.close()
+
 init_db()
 
 class ChatRequest(BaseModel):
@@ -92,31 +102,30 @@ def run_tts_in_thread(text, filename, voice):
 def chat(request: ChatRequest):
     char_id = request.character_id
     char_config = CHARACTERS.get(char_id, CHARACTERS["girl"])
-    
+
     conn = sqlite3.connect('memory.db')
     c = conn.cursor()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
+
     c.execute("SELECT affection FROM chat_history WHERE character = ? ORDER BY id DESC LIMIT 1", (char_id,))
     row = c.fetchone()
     current_affection = row[0] if row else 50
-        
-    c.execute("INSERT INTO chat_history (character, role, content, timestamp, affection) VALUES (?, ?, ?, ?, ?)", 
+
+    c.execute("INSERT INTO chat_history (character, role, content, timestamp, affection) VALUES (?, ?, ?, ?, ?)",
               (char_id, "user", request.user_message, now, current_affection))
-    
+
     # 短期记忆：最近 4 句
     c.execute("SELECT role, content FROM chat_history WHERE character = ? ORDER BY id DESC LIMIT 4", (char_id,))
     rows = c.fetchall()
     conn.close()
     rows.reverse()
-    
+
     # 长期记忆检索（RAG）
     long_term_memory = ""
     try:
         # 把用户的话变成向量
         q_res = client_embed.embeddings.create(model="embedding-3", input=request.user_message)
         q_vector = q_res.data[0].embedding
-        
         # 去记忆库里搜最相关的 2 条记录
         results = collection.query(query_embeddings=[q_vector], n_results=2)
         if results['documents'] and results['documents'][0]:
@@ -124,12 +133,12 @@ def chat(request: ChatRequest):
             long_term_memory = "\n【历史记忆】\n" + "\n".join(memory_texts)
     except Exception as e:
         print(f"长期记忆检索失败: {e}")
-    
+
     # 拼接 Prompt
     messages = [{"role": "system", "content": char_config["prompt"] + long_term_memory}]
     for role, content in rows:
         messages.append({"role": role, "content": content})
-    
+
     tools = [
         {
             "type": "function",
@@ -144,21 +153,19 @@ def chat(request: ChatRequest):
             }
         }
     ]
-    
+
     try:
         response = client_chat.chat.completions.create(
-            model="deepseek-reasoner",
+            model="deepseek-chat",   # 方案A：支持工具调用的对话模型
             messages=messages,
             tools=tools,
             temperature=0.8
         )
-        
         message = response.choices[0].message
-        
+
         if message.tool_calls:
             print(f"\n【系统日志】触发工具调用: {message.tool_calls[0].function.name}")
             messages.append(message)
-            
             for tool_call in message.tool_calls:
                 if tool_call.function.name == "get_weather":
                     args = json.loads(tool_call.function.arguments)
@@ -168,26 +175,25 @@ def chat(request: ChatRequest):
                         "tool_call_id": tool_call.id,
                         "content": weather_result
                     })
-            
             final_response = client_chat.chat.completions.create(
-                model="deepseek-reasoner",
+                model="deepseek-chat",   # 方案A：工具调用后的最终回答
                 messages=messages,
                 temperature=0.8
             )
             reply = final_response.choices[0].message.content
         else:
             reply = message.content
-            
+
         aff_change = 5 if "【" in request.user_message else 0
         new_affection = max(0, min(100, current_affection + aff_change))
-        
+
         conn = sqlite3.connect('memory.db')
         c = conn.cursor()
-        c.execute("INSERT INTO chat_history (character, role, content, timestamp, affection) VALUES (?, ?, ?, ?, ?)", 
+        c.execute("INSERT INTO chat_history (character, role, content, timestamp, affection) VALUES (?, ?, ?, ?, ?)",
                   (char_id, "assistant", reply, now, new_affection))
         conn.commit()
         conn.close()
-        
+
         # 将这次互动存入长期记忆库
         try:
             memory_content = f"用户说：{request.user_message}，你回答：{reply}"
@@ -199,13 +205,13 @@ def chat(request: ChatRequest):
             )
         except Exception as e:
             print(f"记忆存储失败: {e}")
-        
+
         clean_text_for_tts = re.sub(r'\(.*?\)', '', reply).strip()
         audio_filename = f"voice_{char_id}_{int(datetime.datetime.now().timestamp())}.mp3"
         run_tts_in_thread(clean_text_for_tts, audio_filename, char_config["voice"])
-        
+
         return {
-            "status": "success", 
+            "status": "success",
             "reply": reply,
             "audio_url": f"/api/audio/{audio_filename}",
             "affection": new_affection
@@ -219,3 +225,17 @@ def get_audio(filename: str):
     if os.path.exists(filename):
         return FileResponse(filename, media_type="audio/mpeg")
     return {"status": "error", "message": "音频不存在"}
+
+# ================= 4. 托管前端构建产物（单服务部署） =================
+# 注意：必须放在所有 API 路由定义之后，否则会拦截 /api/*
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+dist_dir = BASE_DIR / "dist"
+if dist_dir.exists():
+    app.mount("/", StaticFiles(directory=str(dist_dir), html=True), name="dist")
+    print(f"[部署] 已托管前端产物: {dist_dir}")
+
+# ================= 5. 启动入口（Render 用 $PORT） =================
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8007))
+    uvicorn.run(app, host="0.0.0.0", port=port)
