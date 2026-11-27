@@ -147,7 +147,9 @@ except Exception as e:
 
 
 # ================= 2. 工具与人设 =================
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+def tavily_key() -> str:
+    """请求时动态读取，改环境变量后无需依赖部署环节即可生效"""
+    return (os.getenv("TAVILY_API_KEY") or "").strip()
 
 
 def get_weather(city: str) -> str:
@@ -168,12 +170,13 @@ def get_weather(city: str) -> str:
 
 def search_web(query: str) -> str:
     """联网搜索（Tavily）。未配置 TAVILY_API_KEY 时返回提示，聊天不受影响"""
-    if not TAVILY_API_KEY:
+    key = tavily_key()
+    if not key:
         return "（联网搜索服务未配置，请告知用户暂时无法查询实时信息）"
     try:
         resp = requests.post(
             "https://api.tavily.com/search",
-            json={"api_key": TAVILY_API_KEY, "query": query,
+            json={"api_key": key, "query": query,
                   "max_results": 4, "search_depth": "basic"},
             timeout=10,
         )
@@ -203,7 +206,7 @@ def build_tools():
                            "required": ["city"]}
         }
     }]
-    if TAVILY_API_KEY:
+    if tavily_key():
         tools.append({
             "type": "function",
             "function": {
@@ -261,9 +264,20 @@ except Exception:
     STYLE_SAMPLES = []
 
 
+DSML_RE = re.compile(r'</?｜｜DSML｜｜[^>]*>|</?｜｜DSML｜｜')
+
+
+def sanitize_reply(text: str) -> str:
+    """清洗 DeepSeek 偶发泄漏的内部工具调用标记（DSML），避免存入聊天记录"""
+    cleaned = DSML_RE.sub('', text or '')
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+    return cleaned
+
+
 def parse_reply(raw):
     """解析情绪 JSON 协议，返回 (reply, emotion)；解析失败时整体作为回复"""
-    text = (raw or "").strip()
+    text = sanitize_reply(raw)
+    had_dsml = bool(DSML_RE.search(raw or ''))
     candidates = [text]
     m = re.search(r'\{[\s\S]*"reply"[\s\S]*\}', text)
     if m:
@@ -277,6 +291,9 @@ def parse_reply(raw):
                 return reply, emotion if emotion in EMOTION_SET else "neutral"
         except Exception:
             continue
+    if had_dsml:
+        # 整段是泄漏的内部工具语法（或清洗后剩残渣），不可作为回复
+        return "……", "neutral"
     return text or "……", "neutral"
 
 
@@ -443,7 +460,7 @@ def db_check():
         "pro_count": None,
         "stripe_configured": bool(STRIPE_SDK_OK and os.getenv("STRIPE_SECRET_KEY")
                                   and os.getenv("STRIPE_PRICE_ID")),
-        "search_configured": bool(TAVILY_API_KEY),
+        "search_configured": bool(tavily_key()),
         "style_samples": len(STYLE_SAMPLES),
     }
     if not DB_READY or not SessionLocal:
