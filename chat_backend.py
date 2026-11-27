@@ -9,6 +9,7 @@ import tempfile
 import traceback
 import edge_tts
 import re
+import random
 import requests
 import json
 import datetime
@@ -372,9 +373,12 @@ def build_system_prompt():
         lines.append("【注意】不要生硬复述这些记忆，只在相关话题下自然引用。")
         base += "\n".join(lines)
     if STYLE_SAMPLES:
+        picks = random.sample(STYLE_SAMPLES, min(6, len(STYLE_SAMPLES)))
         shots = ["\n\n【说话风格示例（模仿这种口吻与节奏，但不要照抄内容）】"]
-        for s in STYLE_SAMPLES[:6]:
-            shots.append(f"她说：{s.get('user', '')}\n你回：{s.get('assistant', '')}")
+        for s in picks:
+            u = s.get("user_zh") or s.get("user", "")
+            a = s.get("assistant_zh") or s.get("assistant", "")
+            shots.append(f"她说：{u}\n你回：{a}")
         base += "\n".join(shots)
     return base
 
