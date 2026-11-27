@@ -1,0 +1,27 @@
+# ============================================================
+# Render Blueprint —— 仅用于创建「每日早安」Cron Job
+#
+# ⚠️ 重要：你的 Web Service (saki-ai-backend) 是手动创建的，
+#    这里故意不重复声明它，避免 Blueprint 重建/覆盖现有服务。
+#    用这个文件新建一个 Blueprint 时，Render 只会创建下面的 cron 服务。
+#
+# 时区说明：Render 的 schedule 使用 UTC。
+#   北京时间 08:00 = UTC 00:00  =>  "0 0 * * *"
+# ============================================================
+services:
+  - type: cron
+    name: ai-companion-morning-greeting
+    runtime: python
+    plan: starter
+    schedule: "0 0 * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python cron_greeting.py"
+    envVars:
+      - key: BACKEND_URL
+        value: https://saki-ai-backend.onrender.com
+      - key: CRON_SECRET
+        sync: false          # 自己设一串随机字符串，并与 Web Service 保持一致
+      - key: DATABASE_URL
+        sync: false          # 与 Web Service 相同（IPv4 Session Pooler 串）
+      - key: DEEPSEEK_API_KEY
+        sync: false
