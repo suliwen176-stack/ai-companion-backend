@@ -25,6 +25,8 @@ def main():
             print(f"[cron] 后端返回失败: {body}")
             sys.exit(1)
         print(f"[cron] ✅ 早安已写入: {body.get('greeting')}")
+        refl = body.get("reflection") or {}
+        print(f"[cron] 每日反思: {refl}")
     except Exception as e:
         print(f"[cron] ❌ 执行失败: {type(e).__name__}: {e}")
         sys.exit(1)
