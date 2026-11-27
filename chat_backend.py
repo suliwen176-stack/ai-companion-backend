@@ -2,8 +2,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import sqlite3
-import datetime
 import os
 import asyncio
 import threading
@@ -11,13 +9,17 @@ import edge_tts
 import re
 import requests
 import json
+import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
+
+# 引入 SQLAlchemy
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 load_dotenv()
 app = FastAPI()
 
-# 允许前端跨域请求
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,7 +30,33 @@ app.add_middleware(
 
 client_chat = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
 
-# ================= 1. 定义本地工具（查天气） =================
+# ================= 1. 云数据库配置 =================
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    print("⚠️ 警告：未配置 DATABASE_URL，请在环境变量中添加！")
+    
+# 兼容 postgres:// 前缀
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# 定义数据表模型
+class ChatHistory(Base):
+    __tablename__ = "chat_history"
+    id = Column(Integer, primary_key=True, index=True)
+    character = Column(String, default="girl")
+    role = Column(String)
+    content = Column(Text)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+    affection = Column(Integer, default=50)
+
+# 如果表不存在则自动创建
+Base.metadata.create_all(bind=engine)
+
+# ================= 2. 工具函数 =================
 def get_weather(city: str) -> str:
     try:
         url = f"https://wttr.in/{city}?format=j1"
@@ -43,7 +71,6 @@ def get_weather(city: str) -> str:
     except Exception as e:
         return f"查询天气失败，错误信息：{e}"
 
-# ================= 2. 角色配置（将记忆刻入底层基因） =================
 CHARACTERS = {
     "girl": {
         "name": "专属AI教练",
@@ -56,22 +83,10 @@ CHARACTERS = {
         1. 你必须用专业、耐心、鼓励的语气回答，称呼她为“同学”。
         2. 绝对不要用傲娇、结巴的语气，更不要自称“星野”。
         3. 如果用户询问天气，你必须先调用 get_weather 工具获取真实数据。
-        4. 每次回复控制在 150 字以内，直接给解决方案或建议，带一点自然的口语化表达。""",
-        "voice": "zh-CN-YunxiNeural" # 换成温润如玉的男声（云希）
+        4. 每次回复控制在 150 字以内，直接给解决方案或建议。""",
+        "voice": "zh-CN-YunxiNeural"
     }
 }
-
-# 初始化数据库（每次重启都会重建表，保证好感度默认50）
-def init_db():
-    conn = sqlite3.connect('memory.db')
-    c = conn.cursor()
-    c.execute("DROP TABLE IF EXISTS chat_history")
-    c.execute('''CREATE TABLE IF NOT EXISTS chat_history
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                  character TEXT, role TEXT, content TEXT, timestamp TEXT, affection INTEGER DEFAULT 50)''')
-    conn.commit()
-    conn.close()
-init_db()
 
 class ChatRequest(BaseModel):
     user_message: str
@@ -93,52 +108,36 @@ def chat(request: ChatRequest):
     char_id = request.character_id
     char_config = CHARACTERS.get(char_id, CHARACTERS["girl"])
     
-    conn = sqlite3.connect('memory.db')
-    c = conn.cursor()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # 获取当前好感度
-    c.execute("SELECT affection FROM chat_history WHERE character = ? ORDER BY id DESC LIMIT 1", (char_id,))
-    row = c.fetchone()
-    current_affection = row[0] if row else 50
+    db = SessionLocal()
+    try:
+        # 获取当前好感度
+        last_record = db.query(ChatHistory).filter(ChatHistory.character == char_id).order_by(ChatHistory.id.desc()).first()
+        current_affection = last_record.affection if last_record else 50
         
-    # 插入用户消息
-    c.execute("INSERT INTO chat_history (character, role, content, timestamp, affection) VALUES (?, ?, ?, ?, ?)", 
-              (char_id, "user", request.user_message, now, current_affection))
-    
-    # 获取最近 6 句对话（短期记忆）
-    c.execute("SELECT role, content FROM chat_history WHERE character = ? ORDER BY id DESC LIMIT 6", (char_id,))
-    rows = c.fetchall()
-    conn.close()
-    rows.reverse()
-    
-    # 拼接发给大模型的消息
-    messages = [{"role": "system", "content": char_config["prompt"]}]
-    for role, content in rows:
-        messages.append({"role": role, "content": content})
-    
-    # 提供天气工具
-    tools = [
-        {
+        # 插入用户消息
+        user_msg = ChatHistory(character=char_id, role="user", content=request.user_message, affection=current_affection)
+        db.add(user_msg)
+        db.commit()
+        
+        # 获取最近 6 句对话
+        recent_records = db.query(ChatHistory).filter(ChatHistory.character == char_id).order_by(ChatHistory.id.desc()).limit(6).all()
+        recent_records.reverse()
+        
+        messages = [{"role": "system", "content": char_config["prompt"]}]
+        for record in recent_records:
+            messages.append({"role": record.role, "content": record.content})
+        
+        tools = [{
             "type": "function",
             "function": {
                 "name": "get_weather",
                 "description": "查询指定城市的实时天气",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "city": {"type": "string", "description": "城市名称，例如：威海、北京"}
-                    },
-                    "required": ["city"]
-                }
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
             }
-        }
-    ]
-    
-    try:
-        # 请求 DeepSeek
+        }]
+        
         response = client_chat.chat.completions.create(
-            model="deepseek-chat", # 用回 chat 模型，速度更快
+            model="deepseek-chat",
             messages=messages,
             tools=tools,
             temperature=0.7
@@ -146,7 +145,6 @@ def chat(request: ChatRequest):
         
         message = response.choices[0].message
         
-        # 处理工具调用
         if message.tool_calls:
             print(f"\n【系统日志】教练触发工具调用: {message.tool_calls[0].function.name}")
             messages.append(message)
@@ -161,7 +159,6 @@ def chat(request: ChatRequest):
                         "content": weather_result
                     })
             
-            # 再次请求生成最终回复
             final_response = client_chat.chat.completions.create(
                 model="deepseek-chat",
                 messages=messages,
@@ -171,19 +168,14 @@ def chat(request: ChatRequest):
         else:
             reply = message.content
             
-        # 更新好感度（如果用户用了互动按钮，好感度+5）
         aff_change = 5 if "【" in request.user_message else 0
         new_affection = max(0, min(100, current_affection + aff_change))
         
-        # 保存 AI 的回复到数据库
-        conn = sqlite3.connect('memory.db')
-        c = conn.cursor()
-        c.execute("INSERT INTO chat_history (character, role, content, timestamp, affection) VALUES (?, ?, ?, ?, ?)", 
-                  (char_id, "assistant", reply, now, new_affection))
-        conn.commit()
-        conn.close()
+        # 保存 AI 回复
+        ai_msg = ChatHistory(character=char_id, role="assistant", content=reply, affection=new_affection)
+        db.add(ai_msg)
+        db.commit()
         
-        # 过滤括号内的动作，生成语音
         clean_text_for_tts = re.sub(r'\(.*?\)', '', reply).strip()
         audio_filename = f"voice_{char_id}_{int(datetime.datetime.now().timestamp())}.mp3"
         run_tts_in_thread(clean_text_for_tts, audio_filename, char_config["voice"])
@@ -197,6 +189,8 @@ def chat(request: ChatRequest):
     except Exception as e:
         print(f"Error: {e}")
         return {"status": "error", "message": str(e)}
+    finally:
+        db.close()
 
 @app.get("/api/audio/{filename}")
 def get_audio(filename: str):
