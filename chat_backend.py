@@ -12,6 +12,7 @@ import re
 import requests
 import json
 import datetime
+import urllib.parse
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -444,6 +445,31 @@ def extract_memories_async(user_text: str, client_id: str = ""):
 
 
 # ================= 4. 自检接口 =================
+def database_url_diag():
+    """DATABASE_URL 脱敏诊断：不泄露密码，只报告结构特征"""
+    raw = os.getenv("DATABASE_URL") or ""
+    if not raw:
+        return {"present": False}
+    stripped = raw.strip()
+    diag = {
+        "present": True,
+        "length": len(raw),
+        "has_surrounding_quotes": raw != stripped and raw[:1] in "\"'",
+        "has_whitespace": any(c.isspace() for c in raw),
+        "scheme": stripped.split("://", 1)[0] if "://" in stripped else "(缺少 ://)",
+        "has_at_sign": "@" in stripped,
+        "has_password": urllib.parse.urlparse(stripped).password is not None,
+    }
+    try:
+        u = urllib.parse.urlparse(stripped)
+        diag["host"] = u.hostname
+        diag["port"] = u.port
+        diag["database"] = u.path
+    except Exception as e:
+        diag["parse_error"] = f"{type(e).__name__}: {e}"
+    return diag
+
+
 @app.get("/api/db-check")
 def db_check():
     result = {
@@ -452,6 +478,7 @@ def db_check():
         "db_name": engine.url.database if engine else None,
         "driver": engine.url.drivername if engine else None,
         "has_database_url": bool(os.getenv("DATABASE_URL")),
+        "url_diag": database_url_diag(),
         "error": DB_ERROR or None,
         "row_count": None,
         "last_message": None,
