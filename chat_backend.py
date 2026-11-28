@@ -398,11 +398,79 @@ CATEGORY_LABELS = {
 VALID_CATEGORIES = set(CATEGORY_LABELS.keys())
 
 
+# ================= 双模式引擎：推进 push / 托底 hold =================
+# 同一套人格底色，两种响应姿态。识别原则：显式换挡 > 语义信号 > 时段信号；
+# 情绪词与任务词同时出现时先托底（表面问方案，底层是撑不住）。
+PUSH_KEYWORDS = ("怎么办", "该怎么", "怎么选", "该不该", "要不要", "方案", "计划",
+                 "复盘", "下一步", "纠结", "选择", "面试", "简历", "跳槽", "转型",
+                 "决策", "利弊", "分析一下", "拆解", "卡住", "卡在", "拖延",
+                 "目标", "进度", "规划", "安排")
+HOLD_KEYWORDS = ("累", "撑不住", "崩溃", "emo", "难过", "难受", "烦死", "焦虑",
+                 "委屈", "不想动", "失眠", "睡不着", "低落", "压力", "想哭",
+                 "没意思", "心累", "害怕", "慌", "迷茫", "空落落", "孤独",
+                 "不想说话", "没力气", "真没用", "怀疑自己", "被掏空",
+                 "精疲力竭", "心力交瘁", "麻了", "卷不动", "熬不动", "喘不过")
+MODE_MEM_PRIORITY = {
+    "push": {"goal", "pitfall", "learning", "work"},
+    "hold": {"preference", "life", "personality"},
+}
+MODE_STYLE_CATEGORIES = {
+    "push": {"technical_companionship", "curious_followup", "memory_reference", "humor_lightness"},
+    "hold": {"empathy", "listening", "warmth", "boundary_safety", "emotional_escalation"},
+}
+MODE_STANCES = {
+    "push": """【本轮姿态：推进模式——她在理思路、做决定或攻坚】
+- 像并肩讨论方案的人：帮她拆变量、给选项、看代价、定最小动作。
+- 结构清晰、短句利落，直击关键变量；最多给 1-3 个可执行选项，不甩十条建议清单。
+- 可以直接问关键问题，推她把卡点说清楚；不用「你应该/你必须」式说教。
+- 记忆优先参考她的目标、当前阶段和踩过的坑。""",
+    "hold": """【本轮姿态：托底模式——她累了、情绪过载或深夜独处】
+- 像坐在旁边听她把话说完的人：语气温和、节奏放慢、少给指令，多做承接。
+- 不推进议程、不给方案清单、不连环提问；先接住情绪，帮她给情绪命名。
+- 回复保持 150 字以内；允许留白，她不想聊就不追问。
+- 如果她表面问「该怎么选」但情绪明显很重，先稳住状态，方案等呼吸顺了再说。
+- 记忆优先参考她的解压习惯、在意的人和事。""",
+}
+
+
+def detect_mode(user_message: str, explicit: str = "auto") -> str:
+    """返回 "push" | "hold" | "neutral"。用户显式换挡优先于自动识别。"""
+    if explicit in ("push", "hold"):
+        return explicit
+    text = (user_message or "").strip()
+    if not text:
+        return "neutral"
+    has_push = any(k in text for k in PUSH_KEYWORDS)
+    has_hold = (any(k in text for k in HOLD_KEYWORDS)
+                or any(k in text for k in CRISIS_KEYWORDS))
+    if has_push and has_hold:
+        return "hold"          # 先托底，再推进
+    if has_hold:
+        return "hold"
+    if has_push:
+        return "push"
+    # 深夜（北京时间 22:00-06:00）的短消息、且无任务信号 → 偏托底
+    bj_hour = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).hour
+    if (bj_hour >= 22 or bj_hour < 6) and len(text) <= 60:
+        return "hold"
+    return "neutral"
+
+
+def _edge_slow(rate: str, delta: int) -> str:
+    """Edge-TTS 语速字符串加减百分点，如 "-6%" - 6 -> "-12%\""""
+    m = re.match(r'([+-])(\d+)%$', (rate or "+0%").strip())
+    if not m:
+        return f"{'+' if delta >= 0 else '-'}{abs(delta)}%"
+    val = int(m.group(2)) * (1 if m.group(1) == "+" else -1) + delta
+    return f"{'+' if val >= 0 else '-'}{abs(val)}%"
+
+
 class ChatRequest(BaseModel):
     user_message: str
     character_id: str = "girl"
     client_id: str = ""
     voice_variant: str = "main"
+    mode: str = "auto"          # auto（自动识别）/ push（理思路）/ hold（随便聊聊）
 
 
 class MemoryCreate(BaseModel):
@@ -570,8 +638,9 @@ def _content_bigrams(s: str) -> set:
     return {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
 
 
-def build_system_prompt(char_id: str = DEFAULT_CHAR_ID, user_message: str = ""):
-    """角色人设 + 相关性记忆 + 说话风格锚点，动态拼装"""
+def build_system_prompt(char_id: str = DEFAULT_CHAR_ID, user_message: str = "",
+                        mode: str = "neutral"):
+    """角色人设 + 相关性记忆 + 说话风格锚点 + 模式姿态，动态拼装"""
     char_config = CHARACTERS.get(char_id, CHARACTERS[DEFAULT_CHAR_ID])
     base = BASE_PROMPT + "\n\n【你的角色（必须始终以这个身份说话）】\n" + char_config["persona"]
     items, groups = get_all_memories()
@@ -579,9 +648,12 @@ def build_system_prompt(char_id: str = DEFAULT_CHAR_ID, user_message: str = ""):
         # 记忆按相关性挑选而非全量注入：身份/偏好类常驻，其余按与当前消息的重叠度取
         # 高相关 + 最近新增的几条，避免每次都背同一套清单
         msg_bi = _content_bigrams(user_message)
+        prio = MODE_MEM_PRIORITY.get(mode, set())
 
         def relevance(m):
-            return len(_content_bigrams(m["content"]) & msg_bi)
+            # 相关性为主，模式加权为辅（同等相关时优先参考模式侧重的记忆面）
+            return (len(_content_bigrams(m["content"]) & msg_bi)
+                    + (2 if m["category"] in prio else 0))
 
         always = [m for m in items if m["category"] in ("identity", "preference", "goal")]
         others = [m for m in items if m not in always]
@@ -594,13 +666,20 @@ def build_system_prompt(char_id: str = DEFAULT_CHAR_ID, user_message: str = ""):
         lines.append("【注意】引用记忆要像「想起来了」，不要像报账；没被提到的记忆不等于忘记。")
         base += "\n".join(lines)
     if STYLE_SAMPLES:
-        picks = random.sample(STYLE_SAMPLES, min(6, len(STYLE_SAMPLES)))
+        # 风格样本按模式分层：托底时参考接住情绪的样本，推进时参考专业利落的样本
+        want = MODE_STYLE_CATEGORIES.get(mode)
+        pool = ([s for s in STYLE_SAMPLES if s.get("category") in want] if want
+                else STYLE_SAMPLES) or STYLE_SAMPLES
+        picks = random.sample(pool, min(6, len(pool)))
         shots = ["\n\n【说话风格示例（模仿这种口吻与节奏，但不要照抄内容）】"]
         for s in picks:
             u = s.get("user_zh") or s.get("user", "")
             a = s.get("assistant_zh") or s.get("assistant", "")
             shots.append(f"她说：{u}\n你回：{a}")
         base += "\n".join(shots)
+    stance = MODE_STANCES.get(mode)
+    if stance:
+        base += "\n\n" + stance
     return base
 
 
@@ -1228,6 +1307,8 @@ def subscription_status(client_id: str = ""):
 def chat(request: ChatRequest):
     char_id = request.character_id if request.character_id in CHARACTERS else DEFAULT_CHAR_ID
     char_config = CHARACTERS[char_id]
+    # 双模式：显式换挡优先，否则按语义+时段自动识别
+    mode = detect_mode(request.user_message, request.mode)
 
     if not DB_READY or not SessionLocal:
         print("[chat] ⚠️ 数据库未就绪，本轮对话不会被保存", flush=True)
@@ -1247,8 +1328,8 @@ def chat(request: ChatRequest):
             db.add(user_msg)
             db.commit()
 
-            # 北极星指标：服务端消息埋点 + 危机信号检测（只记事件，不记内容）
-            log_event(request.client_id, "message_sent", char_id)
+            # 北极星指标：服务端消息埋点（含模式）+ 危机信号检测（只记事件，不记内容）
+            log_event(request.client_id, "message_sent", f"{char_id}|mode={mode}")
             if any(k in request.user_message for k in CRISIS_KEYWORDS):
                 log_event(request.client_id, "crisis_flag", char_id)
                 print("[metrics] ⚠️ 检测到危机信号，已记录事件", flush=True)
@@ -1258,8 +1339,8 @@ def chat(request: ChatRequest):
                               .order_by(ChatHistory.id.desc()).limit(8).all())
             recent_records.reverse()
 
-        # 人设 + 结构化长期记忆 + 风格锚点动态拼装
-        messages = [{"role": "system", "content": build_system_prompt(char_id, request.user_message)}]
+        # 人设 + 结构化长期记忆 + 风格锚点 + 模式姿态动态拼装
+        messages = [{"role": "system", "content": build_system_prompt(char_id, request.user_message, mode)}]
         for record in recent_records:
             # 跳过空内容与每日早安（早安是主动陪伴消息，不当作对话上下文）
             if record.content and not record.content.startswith("【早安】"):
@@ -1304,13 +1385,17 @@ def chat(request: ChatRequest):
             db.add(ai_msg)
             db.commit()
 
-        # 语音合成失败不影响聊天与持久化
+        # 语音合成失败不影响聊天与持久化；托底模式整体放慢语速（有人坐在旁边听你说话的节奏）
         audio_url = None
         try:
             clean_text_for_tts = re.sub(r'\(.*?\)', '', reply).strip()
             audio_filename = f"voice_{char_id}_{int(datetime.datetime.now().timestamp())}.mp3"
             full_path = os.path.join(AUDIO_DIR, audio_filename)
-            run_tts_in_thread(clean_text_for_tts, full_path, char_config, request.voice_variant)
+            tts_config = dict(char_config)
+            if mode == "hold":
+                tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.9
+                tts_config["rate"] = _edge_slow(char_config.get("rate"), -6)
+            run_tts_in_thread(clean_text_for_tts, full_path, tts_config, request.voice_variant)
             if os.path.exists(full_path):
                 audio_url = f"/api/audio/{audio_filename}"
         except Exception as tts_err:
@@ -1332,6 +1417,7 @@ def chat(request: ChatRequest):
             "affection": new_affection,
             "db_persisted": bool(db),
             "is_pro": is_pro(request.client_id),
+            "mode": mode,
         }
     except Exception as e:
         if db:
