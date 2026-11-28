@@ -1560,15 +1560,24 @@ def chat(request: ChatRequest):
             audio_filename = f"voice_{char_id}_{int(datetime.datetime.now().timestamp())}.mp3"
             full_path = os.path.join(AUDIO_DIR, audio_filename)
             tts_config = dict(char_config)
-            if mode == "hold":
+            voice_override = None
+            if request.cloned_voice and request.client_id:
+                voice_override = get_cloned_voice(request.client_id)
+            if voice_override:
+                # 复刻音色天然比预置音色语速慢、连贯性弱（短样本克隆的固有特性）：
+                # 放慢幅度减半，常态下还略微提速，避免"太慢、不连贯、不像正常人"
+                if mode == "story":
+                    tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.95
+                elif mode == "hold":
+                    tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.98
+                else:
+                    tts_config["ds_rate"] = 1.05
+            elif mode == "hold":
                 tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.9
                 tts_config["rate"] = _edge_slow(char_config.get("rate"), -6)
             elif mode == "story":
                 tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.85
                 tts_config["rate"] = _edge_slow(char_config.get("rate"), -10)
-            voice_override = ""
-            if request.cloned_voice and request.client_id:
-                voice_override = get_cloned_voice(request.client_id)
             run_tts_in_thread(clean_text_for_tts, full_path, tts_config, request.voice_variant,
                               voice_override=voice_override or None)
             if os.path.exists(full_path):
@@ -1699,7 +1708,7 @@ def voice_preview(char_id: str, variant: str = "main", client_id: str = ""):
         return {"status": "error", "message": "角色不存在"}
     # 缓存键绑定当前 API key 指纹：换 key / 修好 key 后自动重新合成，
     # 避免「百炼失败回退 Edge 的旧音频」被当成百炼结果长期缓存。
-    key_fp = hashlib.md5((ds_tts_key() + "|" + sf_tts_key()).encode()).hexdigest()[:8]
+    key_fp = hashlib.md5((ds_tts_key() + "|" + sf_tts_key() + "|v2-clone-rate").encode()).hexdigest()[:8]
     voice_override = None
     if variant == "clone":
         voice_override = get_cloned_voice(client_id)
@@ -1712,7 +1721,12 @@ def voice_preview(char_id: str, variant: str = "main", client_id: str = ""):
     full_path = os.path.join(AUDIO_DIR, filename)
     try:
         if not os.path.isfile(full_path):
-            run_tts_in_thread(config["preview"], full_path, config, vtag,
+            preview_config = config
+            if voice_override:
+                # 复刻音色天然偏慢，试听时与聊天保持一致：常态略微提速
+                preview_config = dict(config)
+                preview_config["ds_rate"] = 1.05
+            run_tts_in_thread(config["preview"], full_path, preview_config, vtag,
                               voice_override=voice_override)
         if os.path.isfile(full_path):
             return FileResponse(full_path, media_type="audio/mpeg")
