@@ -594,8 +594,14 @@ def ds_vl_describe(image_data_url: str, user_text: str) -> str:
                 "model": "qwen3-vl-plus",
                 "messages": [
                     {"role": "system", "content":
-                        "你是图片描述器。客观描述图片内容，结合用户的话指出与 TA 相关的重点。"
-                        "120字以内，只描述看得见的事实，不要评价、不要安慰、不要替 AI 回复用户。"},
+                        "你是图像内容分析模块，不是聊天角色。只描述与用户当前问题相关的、可见的、客观的信息。"
+                        "隐私保护规则（必须遵守）："
+                        "1. 不提取、不复述图片中的身份证、银行卡、银行账户、密码、验证码、医疗报告、病历、工资单、精确住址等敏感信息；"
+                        "2. 如果图片包含疑似敏感个人信息，只说明「图片包含疑似敏感信息，不作具体描述」，不输出任何具体内容；"
+                        "3. 不推断人物身份、健康诊断、财务状况、身份属性等图片中不可见的信息；"
+                        "4. 不将任何内容整理为长期记忆候选；"
+                        "5. 对不确定的内容明确说明不确定。"
+                        "120字以内，只输出与用户问题相关的客观描述，不要评价、不要安慰、不要替 AI 回复用户。"},
                     {"role": "user", "content": [
                         {"type": "image_url", "image_url": {"url": image_data_url}},
                         {"type": "text", "text": user_text or "（她没有配文字）"},
@@ -753,6 +759,61 @@ def run_tts_in_thread(text_value, filename, char_config, variant="main",
     thread.join()
 
 
+# ================= 2.5 敏感信息过滤（隐私保护层） =================
+# 目标：身份证号、银行卡号、密码/验证码、医疗诊断细节、工资账户、精确住址
+# 不进入长期记忆，也不经图片描述外泄。正则+规则为主，不依赖 LLM 自觉。
+# 原则：宁可漏记，不可错记——候选命中即丢弃/拦截，由代码层兜底而非只靠提示词。
+
+_SENSITIVE_RULES = [
+    # 18 位身份证号（含校验位 X）。用环视而非 \b：CJK 与数字之间没有词边界
+    ("id_card", re.compile(r"(?<!\d)\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)")),
+    # 银行卡号：13-19 位连写，或 4 位分组（空格/连字符分隔）
+    ("bank_card", re.compile(r"(?<!\d)\d{13,19}(?!\d)|(?<!\d)\d{4}(?:[ -]\d{4}){2,4}(?!\d)")),
+    # 密码 / 验证码 / 口令
+    ("credential", re.compile(r"(?:密码|验证码|口令|支付码|卡密)\s*[：:是]?\s*[A-Za-z0-9]{4,}")),
+    # 医疗诊断细节（确诊/诊断为/处方/病历号/住院号后接具体内容）
+    ("medical", re.compile(r"(?:确诊|诊断为|诊断[:：]|处方|病历号|住院号|检查报告)\s*[：:]?[^\n，。]{2,40}")),
+    # 工资卡号 / 到账账户
+    ("salary_account", re.compile(r"(?:工资|薪资|月薪|年薪|税后|税前)\s*(?:卡号|账号|到账|流水)\s*[：:]?[^\n，。]{0,24}")),
+    # 精确住址（省/市 + 区/县 + 路/街 + 号/栋/室）
+    ("precise_address", re.compile(
+        r"[\u4e00-\u9fa5]{2,8}(?:省|市)[\u4e00-\u9fa5]{2,10}(?:区|县|镇)[\u4e00-\u9fa5\d]{2,15}"
+        r"(?:路|街|道|巷|村)[\u4e00-\u9fa5\d]{1,10}号?"
+        r"[\u4e00-\u9fa5\d]{0,6}(?:栋|幢|单元|室|楼)?")),
+    # 「住在/地址是」后接具体门牌
+    ("address_keyword", re.compile(r"(?:住在|家庭住址|住址|地址是|地址[:：])\s*[^\n，。]{4,40}(?:路|街|道|巷|小区|号)")),
+]
+
+
+def detect_sensitive(text_value: str):
+    """返回命中的敏感类型列表；空列表 = 未命中"""
+    if not text_value:
+        return []
+    return [name for name, pat in _SENSITIVE_RULES if pat.search(text_value)]
+
+
+def filter_sensitive_facts(facts):
+    """过滤记忆候选：命中敏感规则的事实直接丢弃（宁可不记，不可错记）"""
+    kept = []
+    for fact in facts or []:
+        content = str(fact.get("content", "")).strip() if isinstance(fact, dict) else ""
+        hits = detect_sensitive(content)
+        if content and hits:
+            print(f"[privacy] 拦截敏感记忆候选: {hits} | {content[:30]}...", flush=True)
+            continue
+        kept.append(fact)
+    return kept
+
+
+def sanitize_vl_description(desc: str) -> str:
+    """图片描述后过滤兜底：即使 VL 模型没守规矩，也不让敏感内容进入对话与记忆链路"""
+    hits = detect_sensitive(desc or "")
+    if hits:
+        print(f"[privacy] 图片描述命中敏感规则 {hits}，已替换为提示文本", flush=True)
+        return "（这张图片包含疑似敏感的个人信息，为保护隐私不作具体描述。如果你想聊图里的其他内容，可以说说它对你意味着什么。）"
+    return desc
+
+
 # ================= 3. 记忆服务 =================
 FREE_MEMORY_LIMIT = int(os.getenv("FREE_MEMORY_LIMIT", "8"))
 AUTO_EXTRACT = os.getenv("AUTO_EXTRACT_MEMORIES", "true").lower() == "true"
@@ -865,6 +926,10 @@ def extract_memories_async(user_text: str, client_id: str = ""):
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
         facts = json.loads(raw)
         if not isinstance(facts, list) or not facts:
+            return
+        # 隐私保护：敏感信息（证件/卡号/密码/诊断/住址等）不写入长期记忆
+        facts = filter_sensitive_facts(facts)
+        if not facts:
             return
         db = SessionLocal()
         try:
@@ -1154,6 +1219,11 @@ def add_memory(req: MemoryCreate, client_id: str = ""):
         return {"status": "error", "message": "记忆内容不能为空"}
     if len(content) > 120:
         return {"status": "error", "message": "记忆内容请控制在 120 字以内"}
+    # 隐私保护：证件号/银行卡/密码/验证码等不建议存入长期记忆
+    hits = detect_sensitive(content)
+    if hits:
+        return {"status": "error", "code": "SENSITIVE_BLOCKED",
+                "message": "这条内容包含疑似敏感个人信息（证件号/卡号/密码等），为保护隐私不保存在记忆里。"}
     category = req.category if req.category in VALID_CATEGORIES else "other"
     db = SessionLocal()
     try:
@@ -1295,6 +1365,10 @@ def daily_reflection():
                      (resp.choices[0].message.content or "").strip()).strip()
         facts = json.loads(raw)
         if not isinstance(facts, list):
+            return {"status": "success", "added": 0}
+        # 隐私保护：反思沉淀同样过敏感信息过滤
+        facts = filter_sensitive_facts(facts)
+        if not facts:
             return {"status": "success", "added": 0}
         added = 0
         existing_set = set(existing)
@@ -1467,6 +1541,8 @@ def chat(request: ChatRequest):
         if not request.image_data.startswith("data:image/") or len(request.image_data) > MAX_IMAGE_B64:
             raise HTTPException(status_code=413, detail="图片过大或不支持，请小于 4MB")
         image_desc = ds_vl_describe(request.image_data, request.user_message)
+        # 代码层兜底：即使 VL 提示词没守住，敏感内容也不能进入对话与记忆链路
+        image_desc = sanitize_vl_description(image_desc)
         if image_desc:
             print(f"[chat] 图片已理解: {image_desc[:60]}...", flush=True)
 
