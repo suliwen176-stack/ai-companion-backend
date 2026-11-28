@@ -414,9 +414,17 @@ class CheckoutRequest(BaseModel):
     client_id: str
 
 
+def _clean_key(raw: str) -> str:
+    """容忍从 .env 整行复制时带上引号/空白（Render 环境变量不会自动去引号）"""
+    s = (raw or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1].strip()
+    return s.strip()
+
+
 def sf_tts_key() -> str:
     """请求时动态读取，改环境变量后无需重新部署即可生效"""
-    return (os.getenv("SILICONFLOW_API_KEY") or "").strip()
+    return _clean_key(os.getenv("SILICONFLOW_API_KEY"))
 
 
 def _sf_tts(text_value: str, full_path: str, char_config: dict) -> bool:
@@ -450,7 +458,7 @@ def _sf_tts(text_value: str, full_path: str, char_config: dict) -> bool:
 
 def ds_tts_key() -> str:
     """阿里百炼 API Key，请求时动态读取"""
-    return (os.getenv("DASHSCOPE_API_KEY") or "").strip()
+    return _clean_key(os.getenv("DASHSCOPE_API_KEY"))
 
 
 def _ds_tts(text_value: str, full_path: str, voice: str, model: str = "cosyvoice-v2",
@@ -728,6 +736,77 @@ def db_check():
     finally:
         db.close()
     return result
+
+
+@app.get("/api/tts-diagnose")
+def tts_diagnose():
+    """TTS 引擎线上自检：只返回脱敏指纹 + 真实探测结果，绝不输出完整密钥。
+
+    用于排查「环境变量明明显示已配置，但声音仍是 Edge 兜底」这类问题。
+    """
+    import time
+    out = {}
+
+    # ---- 阿里百炼 ----
+    raw_ds = os.getenv("DASHSCOPE_API_KEY") or ""
+    k_ds = ds_tts_key()
+    ds = {
+        "present": bool(raw_ds),
+        "raw_len": len(raw_ds),
+        "clean_len": len(k_ds),
+        "prefix": k_ds[:8] if k_ds else "",
+        "suffix": k_ds[-6:] if k_ds else "",
+        "starts_with_sk": k_ds.startswith("sk-"),
+        "has_stray_quotes": ('"' in raw_ds or "'" in raw_ds),
+        "has_whitespace": any(c.isspace() for c in raw_ds),
+        "quote_was_stripped": len(raw_ds) != len(k_ds),
+    }
+    if k_ds:
+        try:
+            t0 = time.time()
+            r = requests.post(
+                "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer",
+                headers={"Authorization": f"Bearer {k_ds}",
+                         "Content-Type": "application/json"},
+                json={"model": "cosyvoice-v2",
+                      "input": {"text": "自检", "voice": "longxiaoxia_v2",
+                                "format": "mp3", "sample_rate": 44100}},
+                timeout=30)
+            ds["probe_status"] = r.status_code
+            ds["probe_ok"] = r.status_code == 200
+            ds["probe_ms"] = int((time.time() - t0) * 1000)
+            if r.status_code != 200:
+                ds["probe_body"] = r.text[:220]
+        except Exception as e:
+            ds["probe_error"] = f"{type(e).__name__}: {e}"
+    out["dashscope"] = ds
+
+    # ---- SiliconFlow ----
+    k_sf = sf_tts_key()
+    sf = {"present": bool(k_sf), "len": len(k_sf),
+          "prefix": k_sf[:6] if k_sf else ""}
+    if k_sf:
+        try:
+            r = requests.post(
+                "https://api.siliconflow.cn/v1/audio/speech",
+                headers={"Authorization": f"Bearer {k_sf}",
+                         "Content-Type": "application/json"},
+                json={"model": "FunAudioLLM/CosyVoice2-0.5B",
+                      "input": "自检", "voice": "FunAudioLLM/CosyVoice2-0.5B:anna",
+                      "response_format": "mp3"},
+                timeout=30)
+            sf["probe_status"] = r.status_code
+            sf["probe_ok"] = r.status_code == 200
+            if r.status_code != 200:
+                sf["probe_body"] = r.text[:220]
+        except Exception as e:
+            sf["probe_error"] = f"{type(e).__name__}: {e}"
+    out["siliconflow"] = sf
+
+    out["effective_engine"] = ("dashscope" if ds.get("probe_ok")
+                               else "siliconflow" if sf.get("probe_ok")
+                               else "edge-tts (兜底)")
+    return out
 
 
 # ================= 4.5 北极星指标埋点 =================
