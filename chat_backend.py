@@ -632,6 +632,7 @@ def db_check():
         "stripe_configured": bool(STRIPE_SDK_OK and os.getenv("STRIPE_SECRET_KEY")
                                   and os.getenv("STRIPE_PRICE_ID")),
         "search_configured": bool(tavily_key()),
+        "tts_configured": bool(sf_tts_key()),
         "style_samples": len(STYLE_SAMPLES),
     }
     if not DB_READY or not SessionLocal:
