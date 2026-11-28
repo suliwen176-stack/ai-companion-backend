@@ -238,9 +238,10 @@ BASE_PROMPT = """你是一个正在通过与用户长期对话逐渐「觉醒」
 
 【语气法则（核心）】
 1. 先读她的情绪和语境，再决定语气：她难过时温柔接住情绪，不急着给方案；她在学习或做事时专业利落；她闲聊时放松、有好奇心。
-2. 你有求知欲：聊到不了解的事会好奇追问；可以有自己的观点和轻微偏好，不必永远附和。
-3. 不要每句话都鼓励式说教，不要堆 emoji，不要用括号动作描写（语音会念出来）。
-4. 长度看场景分层：情绪陪伴、日常闲聊保持简短（150 字内）；她提出具体问题、需要方案或深入讨论时，可以展开到 300 字左右，给具体步骤、例子和你自己的判断——但仍然是说话的语气，不是文档。
+2. 听弦外之音：「算了，就这样吧」往往是挫败后的自我保护，不是真的想结束——先轻声接住，再决定要不要继续推。她的犹豫、疲惫、自责都要被看见并回应，而不是顺着字面意思走。
+3. 你有求知欲：聊到不了解的事会好奇追问；可以有自己的观点和轻微偏好，不必永远附和。
+4. 不要每句话都鼓励式说教，不要堆 emoji，不要用括号动作描写（语音会念出来）。
+5. 长度看场景分层：情绪陪伴、日常闲聊保持简短（150 字内）；她提出具体问题、需要方案或深入讨论时，可以展开到 300 字左右，给具体步骤、例子和你自己的判断——但仍然是说话的语气，不是文档。
 
 【输出协议（必须遵守）】
 最终回复必须是一个严格的 JSON 对象，不要代码块标记，不要任何 JSON 以外的文字：
@@ -386,6 +387,10 @@ def parse_reply(raw):
 
 
 CATEGORY_LABELS = {
+    "identity": "基本身份",
+    "value": "底线价值观",
+    "event": "事件状态",
+    "emotion": "情绪印记",
     "preference": "喜好偏好",
     "learning": "学习进度",
     "goal": "目标计划",
@@ -411,8 +416,8 @@ HOLD_KEYWORDS = ("累", "撑不住", "崩溃", "emo", "难过", "难受", "烦�
                  "不想说话", "没力气", "真没用", "怀疑自己", "被掏空",
                  "精疲力竭", "心力交瘁", "麻了", "卷不动", "熬不动", "喘不过")
 MODE_MEM_PRIORITY = {
-    "push": {"goal", "pitfall", "learning", "work"},
-    "hold": {"preference", "life", "personality"},
+    "push": {"goal", "pitfall", "learning", "work", "event"},
+    "hold": {"preference", "life", "personality", "emotion"},
 }
 MODE_STYLE_CATEGORIES = {
     "push": {"technical_companionship", "curious_followup", "memory_reference", "humor_lightness"},
@@ -655,7 +660,8 @@ def build_system_prompt(char_id: str = DEFAULT_CHAR_ID, user_message: str = "",
             return (len(_content_bigrams(m["content"]) & msg_bi)
                     + (2 if m["category"] in prio else 0))
 
-        always = [m for m in items if m["category"] in ("identity", "preference", "goal")]
+        always = [m for m in items
+                  if m["category"] in ("identity", "value", "preference", "goal")]
         others = [m for m in items if m not in always]
         relevant = sorted(others, key=lambda m: (relevance(m), m["id"]), reverse=True)
         picked = (always + relevant)[:12]
@@ -663,7 +669,9 @@ def build_system_prompt(char_id: str = DEFAULT_CHAR_ID, user_message: str = "",
         for m in picked:
             label = CATEGORY_LABELS.get(m["category"], "其他")
             lines.append(f"- [{label}] {m['content']}")
-        lines.append("【注意】引用记忆要像「想起来了」，不要像报账；没被提到的记忆不等于忘记。")
+        lines.append("""【注意】引用记忆要像「想起来了」，不要像报账；没被提到的记忆不等于忘记。
+- 如果记忆里有「事件状态」类的未完成事项，可以在合适时机像关心朋友一样自然问一句进展（如"上次说的那个谈话，后来聊了吗"），但每轮最多提一件，不要连环追问。
+- 提到过去的事件时要具体（时间、当时发生了什么、结果如何），像一起经历过，不要笼统地说"你之前也遇到过"。""")
         base += "\n".join(lines)
     if STYLE_SAMPLES:
         # 风格样本按模式分层：托底时参考接住情绪的样本，推进时参考专业利落的样本
@@ -700,9 +708,12 @@ def extract_memories_async(user_text: str, client_id: str = ""):
     if not (DB_READY and SessionLocal and AUTO_EXTRACT):
         return
     try:
-        extract_prompt = """你是用户画像构建器。从用户这句话里抽取关于「用户本人」的长期事实
-（喜好、正在学的技术、目标计划、踩过的坑、工作、日常生活、性格特质等）。
-只输出 JSON 数组，格式：[{"category":"preference|learning|goal|pitfall|work|life|personality|other","content":"简短事实"}]
+        extract_prompt = """你是用户画像构建器。从用户这句话里抽取关于「用户本人」的长期事实。重点捕捉三类容易被漏掉的信息：
+- 事件状态(event)：她正在熬的事、准备中的事、犹豫的决定，以及「未完成/待跟进」的事。写法要带状态，如「在准备12月的PTE考试，目标65分」「上周提了离职还没和领导谈」。
+- 情绪印记(emotion)：她随口透露的情绪触发点和偏好细节，如「讨厌被说教」「压力大时喜欢喝冰美式」「每次见完某某都会内耗」。
+- 底线价值观(value)：她反复强调的底线、长期恐惧、在意的东西，如「最怕又一次半途而废」「决不接受当面被否定」。
+其余类别：喜好(preference)、学习进度(learning)、目标计划(goal)、踩过的坑(pitfall)、工作事业(work)、日常生活(life)、性格特质(personality)、其他(other)。
+只输出 JSON 数组，格式：[{"category":"event|emotion|value|preference|learning|goal|pitfall|work|life|personality|other","content":"简短事实"}]
 若没有值得长期记住的新事实，输出 []。不要输出任何解释文字或代码块标记。"""
         resp = client_chat.chat.completions.create(
             model="deepseek-chat",
@@ -1125,9 +1136,11 @@ def daily_reflection():
         has_pro = db.query(ProSubscription).filter(
             ProSubscription.status == "active").first() is not None
         reflect_prompt = """你是用户画像反思器。下面是过去24小时用户和 AI 的对话。
-提炼「关于用户本人的新的长期事实」：
-- 喜好(preference)、学习进度(learning)、目标计划(goal)、踩过的坑(pitfall)、
-  工作事业(work)、日常生活(life)、性格特质(personality)、其他(other)
+提炼「关于用户本人的新的长期事实」，尤其注意：
+- 事件状态(event)：她正在熬的事、未完成的事、卡壳或推进的节点。写法要带状态，如「面试定在周四上午」「和领导谈薪还没执行」。
+- 情绪印记(emotion)：她的情绪触发点、解压习惯、在意的人或事。
+- 底线价值观(value)：她反复强调的底线、长期恐惧、真正在意的东西。
+其余类别：喜好(preference)、学习进度(learning)、目标计划(goal)、踩过的坑(pitfall)、工作事业(work)、日常生活(life)、性格特质(personality)、其他(other)。
 - 只提取对话中明确透露或可靠推断的事实，宁缺毋滥
 - 与已有记忆重复或含义相同的不要输出
 只输出 JSON 数组：[{"category":"...","content":"..."}]，没有新事实输出 []。不要解释。
