@@ -14,6 +14,7 @@ import hashlib
 import requests
 import json
 import datetime
+import time
 import urllib.parse
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -113,6 +114,15 @@ class EventLog(Base):
     event = Column(String, index=True)
     meta = Column(String, default="")
     created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class VoiceProfile(Base):
+    """声音复刻：client_id → 百炼自定义音色 ID（cosyvoice-v2）"""
+    __tablename__ = "voice_profiles"
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(String, index=True)
+    voice_id = Column(String, default="")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 # 出厂示例记忆：仅当表为空时播种，用户可在侧边栏自行删改
@@ -417,13 +427,17 @@ HOLD_KEYWORDS = ("累", "撑不住", "崩溃", "emo", "难过", "难受", "烦�
                  "精疲力竭", "心力交瘁", "麻了", "卷不动", "熬不动", "喘不过",
                  "算了吧", "就这样吧", "不适合", "想放弃", "没天赋", "学不会",
                  "白费", "白干了", "没意义")
+STORY_KEYWORDS = ("讲个故事", "讲故事", "睡前故事", "晚安故事", "哄睡", "哄我睡",
+                  "哄宝宝", "哄孩子", "讲个童话", "讲童话")
 MODE_MEM_PRIORITY = {
     "push": {"goal", "pitfall", "learning", "work", "event"},
     "hold": {"preference", "life", "personality", "emotion"},
+    "story": {"preference", "life", "emotion"},
 }
 MODE_STYLE_CATEGORIES = {
     "push": {"technical_companionship", "curious_followup", "memory_reference", "humor_lightness"},
     "hold": {"empathy", "listening", "warmth", "boundary_safety", "emotional_escalation"},
+    "story": {"warmth", "listening", "empathy"},
 }
 MODE_STANCES = {
     "push": """【本轮姿态：推进模式——她在理思路、做决定或攻坚】
@@ -437,16 +451,24 @@ MODE_STANCES = {
 - 回复保持 150 字以内；允许留白，她不想聊就不追问。
 - 如果她表面问「该怎么选」但情绪明显很重，先稳住状态，方案等呼吸顺了再说。
 - 记忆优先参考她的解压习惯、在意的人和事。""",
-}
+    "story": """【本轮姿态：哄睡模式——她在让孩子入睡，或想要一段温柔的睡前时光】
+- 像在床边轻声讲故事的人：语速慢、句子短、声音软，多用具体画面（月亮、小动物、云朵、毯子）。
+- 讲故事时结构完整：安静引入 → 温柔的小情节（没有冲突、没有惊吓、没有反派）→ 平静收尾 → 轻声道晚安。
+- 故事可以展开到 400-600 字，分 2-3 个小段；不含说教，结尾越来越安静，最后一句轻轻的。
+- 她没说孩子多大就默认 3-6 岁；想问孩子喜欢什么，放在故事讲完之后轻轻带一句即可。
+- 不追问、不推进任何现实议程；这一轮只有一件事：让人安心入睡。"""}
 
 
 def detect_mode(user_message: str, explicit: str = "auto") -> str:
-    """返回 "push" | "hold" | "neutral"。用户显式换挡优先于自动识别。"""
-    if explicit in ("push", "hold"):
+    """返回 "push" | "hold" | "story" | "neutral"。用户显式换挡优先于自动识别。"""
+    if explicit in ("push", "hold", "story"):
         return explicit
     text = (user_message or "").strip()
     if not text:
         return "neutral"
+    # 讲故事/哄睡是明确意图，优先于情绪与任务词
+    if any(k in text for k in STORY_KEYWORDS):
+        return "story"
     has_push = any(k in text for k in PUSH_KEYWORDS)
     has_hold = (any(k in text for k in HOLD_KEYWORDS)
                 or any(k in text for k in CRISIS_KEYWORDS))
@@ -479,10 +501,16 @@ class ChatRequest(BaseModel):
     voice_variant: str = "main"
     mode: str = "auto"
     image_data: str = ""  # data:image/...;base64,...，可为空
+    cloned_voice: bool = False  # 使用用户复刻的自定义音色
 
 
 class AsrRequest(BaseModel):
     audio: str  # data:audio/...;base64,...
+
+
+class CloneRequest(BaseModel):
+    client_id: str = "default"
+    audio: str  # data:audio/...;base64,...（10-20 秒清晰人声）
     mode: str = "auto"          # auto（自动识别）/ push（理思路）/ hold（随便聊聊）
 
 
@@ -620,6 +648,18 @@ def ds_asr(audio_data_url: str) -> str:
         raise HTTPException(status_code=502, detail="识别服务异常，再试一次")
 
 
+def get_cloned_voice(client_id: str) -> str:
+    """读取用户已复刻的自定义音色 ID；没有则返回空串"""
+    if not (DB_READY and SessionLocal and client_id):
+        return ""
+    db = SessionLocal()
+    try:
+        row = db.query(VoiceProfile).filter(VoiceProfile.client_id == client_id).first()
+        return (row.voice_id or "") if row else ""
+    finally:
+        db.close()
+
+
 def _ds_tts(text_value: str, full_path: str, voice: str, model: str = "cosyvoice-v2",
             rate: float = None, pitch: float = None, volume: int = None) -> bool:
     """阿里百炼 CosyVoice 合成（60+ 性格化预置音色，支持音调调节）"""
@@ -666,17 +706,31 @@ def _ds_tts(text_value: str, full_path: str, voice: str, model: str = "cosyvoice
         return False
 
 
-def run_tts_in_thread(text_value, filename, char_config, variant="main"):
-    """引擎优先级：百炼 CosyVoice > SiliconFlow CosyVoice2 > Edge-TTS（免费兜底）"""
+def run_tts_in_thread(text_value, filename, char_config, variant="main",
+                      voice_override=None, rate_scale=1.0):
+    """引擎优先级：百炼 CosyVoice（含复刻音色）> Edge-TTS（免费兜底）"""
     def target():
-        ds_voice = char_config.get("ds_voice_alt") if variant == "alt" else char_config.get("ds_voice")
-        if not ds_voice:
-            ds_voice = char_config.get("ds_voice") or char_config.get("ds_voice_alt")
+        if voice_override:
+            # 复刻音色绑定在 cosyvoice-v2，不支持音调微调；语速仍可调（哄睡放慢）
+            ds_voice = voice_override
+            ds_model = "cosyvoice-v2"
+            base_rate = char_config.get("ds_rate")
+            ds_rate = base_rate * rate_scale if (base_rate and rate_scale != 1.0) else base_rate
+            ds_pitch = None
+            ds_volume = char_config.get("ds_volume")
+        else:
+            ds_voice = char_config.get("ds_voice_alt") if variant == "alt" else char_config.get("ds_voice")
+            if not ds_voice:
+                ds_voice = char_config.get("ds_voice") or char_config.get("ds_voice_alt")
+            ds_model = char_config.get("ds_model", "cosyvoice-v2")
+            ds_rate = char_config.get("ds_rate")
+            if ds_rate and rate_scale != 1.0:
+                ds_rate = ds_rate * rate_scale
+            ds_pitch = char_config.get("ds_pitch")
+            ds_volume = char_config.get("ds_volume")
         try:
             if ds_voice and _ds_tts(text_value, filename, ds_voice,
-                    char_config.get("ds_model", "cosyvoice-v2"),
-                    char_config.get("ds_rate"), char_config.get("ds_pitch"),
-                    char_config.get("ds_volume")):
+                    ds_model, ds_rate, ds_pitch, ds_volume):
                 return
         except Exception as e:
             print(f"[tts] DashScope 异常: {e}", flush=True)
@@ -686,8 +740,11 @@ def run_tts_in_thread(text_value, filename, char_config, variant="main"):
         except Exception as e:
             print(f"[tts] SiliconFlow 异常: {e}", flush=True)
         async def _generate():
+            edge_rate = char_config.get("rate", "+0%")
+            if rate_scale != 1.0:
+                edge_rate = _edge_slow(edge_rate, -10 if rate_scale < 1 else 10)
             communicate = edge_tts.Communicate(text_value, char_config["voice"],
-                                               rate=char_config.get("rate", "+0%"),
+                                               rate=edge_rate,
                                                pitch=char_config.get("pitch", "+0Hz"))
             await communicate.save(filename)
         asyncio.run(_generate())
@@ -1496,7 +1553,7 @@ def chat(request: ChatRequest):
             db.add(ai_msg)
             db.commit()
 
-        # 语音合成失败不影响聊天与持久化；托底模式整体放慢语速（有人坐在旁边听你说话的节奏）
+        # 语音合成失败不影响聊天与持久化；托底/哄睡模式放慢语速；用户可切换复刻音色
         audio_url = None
         try:
             clean_text_for_tts = re.sub(r'\(.*?\)', '', reply).strip()
@@ -1506,7 +1563,14 @@ def chat(request: ChatRequest):
             if mode == "hold":
                 tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.9
                 tts_config["rate"] = _edge_slow(char_config.get("rate"), -6)
-            run_tts_in_thread(clean_text_for_tts, full_path, tts_config, request.voice_variant)
+            elif mode == "story":
+                tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.85
+                tts_config["rate"] = _edge_slow(char_config.get("rate"), -10)
+            voice_override = ""
+            if request.cloned_voice and request.client_id:
+                voice_override = get_cloned_voice(request.client_id)
+            run_tts_in_thread(clean_text_for_tts, full_path, tts_config, request.voice_variant,
+                              voice_override=voice_override or None)
             if os.path.exists(full_path):
                 audio_url = f"/api/audio/{audio_filename}"
         except Exception as tts_err:
@@ -1547,6 +1611,66 @@ def api_asr(request: AsrRequest):
     return {"status": "success", "text": text_value}
 
 
+@app.post("/api/voice-clone")
+def api_voice_clone(request: CloneRequest):
+    """声音复刻：10-20 秒清晰人声样本 → 自定义音色（约 10-20 秒完成，创建免费）"""
+    key = ds_tts_key()
+    if not key:
+        raise HTTPException(status_code=503, detail="声音复刻未配置（缺少 DASHSCOPE_API_KEY）")
+    if not request.audio.startswith("data:audio/"):
+        raise HTTPException(status_code=400, detail="音频格式不支持")
+    if len(request.audio) > 14_000_000:
+        raise HTTPException(status_code=413, detail="录音太大，请控制在 30 秒内")
+    workspace = (os.getenv("DASHSCOPE_WORKSPACE_ID") or "").strip()
+    base = (f"https://{workspace}.cn-beijing.maas.aliyuncs.com/api/v1" if workspace
+            else "https://dashscope.aliyuncs.com/api/v1")
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    prefix = re.sub(r'[^a-zA-Z0-9]', '', request.client_id)[:10] or "voice"
+    try:
+        r = requests.post(
+            f"{base}/services/audio/tts/customization", headers=headers,
+            json={"model": "voice-enrollment",
+                  "input": {"action": "create_voice", "target_model": "cosyvoice-v2",
+                            "prefix": prefix, "audio": request.audio}},
+            timeout=120)
+        if r.status_code != 200:
+            print(f"[clone] 创建失败 HTTP {r.status_code}: {r.text[:300]}", flush=True)
+            raise HTTPException(status_code=502,
+                detail="复刻创建失败：请检查录音质量（需 ≥10 秒连续清晰人声，安静环境）")
+        voice_id = r.json()["output"]["voice_id"]
+        status = ""
+        for _ in range(30):
+            time.sleep(1.5)
+            q = requests.post(
+                f"{base}/services/audio/tts/customization", headers=headers,
+                json={"model": "voice-enrollment",
+                      "input": {"action": "query_voice", "voice_id": voice_id}},
+                timeout=60)
+            status = (q.json().get("output") or {}).get("status", "")
+            if status == "OK":
+                break
+            if status not in ("", "DEPLOYING"):
+                raise HTTPException(status_code=502,
+                    detail=f"复刻失败（{status}），请换一段更安静的录音再试")
+        if status != "OK":
+            raise HTTPException(status_code=504, detail="复刻超时，请稍后重试")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[clone] 异常: {e}", flush=True)
+        raise HTTPException(status_code=502, detail="复刻服务异常，请稍后再试")
+    if DB_READY and SessionLocal:
+        db = SessionLocal()
+        try:
+            db.query(VoiceProfile).filter(VoiceProfile.client_id == request.client_id).delete()
+            db.add(VoiceProfile(client_id=request.client_id, voice_id=voice_id))
+            db.commit()
+        finally:
+            db.close()
+    return {"status": "success", "voice_id": voice_id,
+            "message": "你的声音已经准备好了，可以开始讲故事了"}
+
+
 # ================= 9. 音频文件 =================
 @app.get("/api/audio/{filename}")
 def get_audio(filename: str):
@@ -1568,7 +1692,7 @@ def list_characters():
 
 
 @app.get("/api/voice-preview/{char_id}")
-def voice_preview(char_id: str, variant: str = "main"):
+def voice_preview(char_id: str, variant: str = "main", client_id: str = ""):
     """按角色音色合成一句试听语音（同步生成，约 2-4 秒）"""
     config = CHARACTERS.get(char_id)
     if not config:
@@ -1576,12 +1700,20 @@ def voice_preview(char_id: str, variant: str = "main"):
     # 缓存键绑定当前 API key 指纹：换 key / 修好 key 后自动重新合成，
     # 避免「百炼失败回退 Edge 的旧音频」被当成百炼结果长期缓存。
     key_fp = hashlib.md5((ds_tts_key() + "|" + sf_tts_key()).encode()).hexdigest()[:8]
-    vtag = variant if variant in ("main", "alt") else "main"
+    voice_override = None
+    if variant == "clone":
+        voice_override = get_cloned_voice(client_id)
+        if not voice_override:
+            return {"status": "error", "message": "还没有你的复刻音色，先去录一段"}
+        vtag = "clone"
+    else:
+        vtag = variant if variant in ("main", "alt") else "main"
     filename = f"preview_{char_id}_{vtag}_{key_fp}.mp3"
     full_path = os.path.join(AUDIO_DIR, filename)
     try:
         if not os.path.isfile(full_path):
-            run_tts_in_thread(config["preview"], full_path, config, vtag)
+            run_tts_in_thread(config["preview"], full_path, config, vtag,
+                              voice_override=voice_override)
         if os.path.isfile(full_path):
             return FileResponse(full_path, media_type="audio/mpeg")
     except Exception as e:
