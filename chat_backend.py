@@ -422,6 +422,11 @@ def _clean_key(raw: str) -> str:
     return s.strip()
 
 
+def sf_tts_enabled() -> bool:
+    """SiliconFlow 默认关闭（音色未被采用且当前欠费），充值后设 SILICONFLOW_TTS_ENABLED=true 可恢复"""
+    return (os.getenv("SILICONFLOW_TTS_ENABLED", "false").strip().lower() == "true")
+
+
 def sf_tts_key() -> str:
     """请求时动态读取，改环境变量后无需重新部署即可生效"""
     return _clean_key(os.getenv("SILICONFLOW_API_KEY"))
@@ -522,7 +527,7 @@ def run_tts_in_thread(text_value, filename, char_config, variant="main"):
         except Exception as e:
             print(f"[tts] DashScope 异常: {e}", flush=True)
         try:
-            if _sf_tts(text_value, filename, char_config):
+            if sf_tts_enabled() and _sf_tts(text_value, filename, char_config):
                 return
         except Exception as e:
             print(f"[tts] SiliconFlow 异常: {e}", flush=True)
@@ -784,8 +789,9 @@ def tts_diagnose():
     # ---- SiliconFlow ----
     k_sf = sf_tts_key()
     sf = {"present": bool(k_sf), "len": len(k_sf),
-          "prefix": k_sf[:6] if k_sf else ""}
-    if k_sf:
+          "prefix": k_sf[:6] if k_sf else "",
+          "enabled": sf_tts_enabled()}
+    if k_sf and sf["enabled"]:
         try:
             r = requests.post(
                 "https://api.siliconflow.cn/v1/audio/speech",
@@ -804,7 +810,7 @@ def tts_diagnose():
     out["siliconflow"] = sf
 
     out["effective_engine"] = ("dashscope" if ds.get("probe_ok")
-                               else "siliconflow" if sf.get("probe_ok")
+                               else "siliconflow" if (sf.get("enabled") and sf.get("probe_ok"))
                                else "edge-tts (兜底)")
     return out
 
