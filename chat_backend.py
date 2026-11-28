@@ -17,7 +17,7 @@ import urllib.parse
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Stripe 为可选依赖：未安装或未配置密钥时，支付接口降级但不影响聊天
@@ -102,6 +102,16 @@ class ProSubscription(Base):
     stripe_customer_id = Column(String)
     status = Column(String, default="active")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class EventLog(Base):
+    """北极星指标埋点：session_start / message_sent / crisis_flag 等轻量事件"""
+    __tablename__ = "event_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(String, index=True)
+    event = Column(String, index=True)
+    meta = Column(String, default="")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
 
 
 # 出厂示例记忆：仅当表为空时播种，用户可在侧边栏自行删改
@@ -585,6 +595,96 @@ def db_check():
     return result
 
 
+# ================= 4.5 北极星指标埋点 =================
+CRISIS_KEYWORDS = ("自杀", "伤害自己", "不想活", "结束一切", "想消失", "自残", "撑不住了")
+
+
+def log_event(client_id: str, event: str, meta: str = ""):
+    """轻量事件写入：任何失败都不影响主流程"""
+    if not (DB_READY and SessionLocal and client_id):
+        return
+    db = SessionLocal()
+    try:
+        db.add(EventLog(client_id=client_id[:64], event=event[:32],
+                        meta=(meta or "")[:120]))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[metrics] 事件写入失败（不影响主流程）: {type(e).__name__}", flush=True)
+    finally:
+        db.close()
+
+
+class TrackRequest(BaseModel):
+    client_id: str
+    event: str
+    meta: str = ""
+
+
+@app.post("/api/track")
+def track(req: TrackRequest):
+    """前端埋点入口：session_start 等客户端事件"""
+    allowed = {"session_start", "page_view", "voice_preview", "character_switch"}
+    if req.event not in allowed:
+        return {"status": "ignored", "message": f"事件 {req.event} 不在白名单"}
+    log_event(req.client_id, req.event, req.meta)
+    return {"status": "success"}
+
+
+@app.get("/api/metrics")
+def metrics():
+    """北极星指标汇总（近似口径，见字段注释）。公开只读，不含任何对话内容"""
+    result = {
+        "db_ready": DB_READY,
+        "users_total": None,
+        "dau_today": None,
+        "messages_total": None,
+        "messages_today": None,
+        "d7_retention_rate": None,
+        "d7_cohort_size": 0,
+        "crisis_flags_30d": None,
+        "note": "d7_retention 为近似口径：7-10 天前首次出现的用户中，最近 3 天仍有事件的比例",
+    }
+    if not (DB_READY and SessionLocal):
+        return result
+
+    now = datetime.datetime.utcnow()
+    db = SessionLocal()
+    try:
+        result["users_total"] = db.query(func.count(func.distinct(EventLog.client_id))).scalar()
+        result["dau_today"] = (db.query(func.count(func.distinct(EventLog.client_id)))
+                               .filter(EventLog.created_at >= now - datetime.timedelta(days=1))
+                               .scalar())
+        result["messages_total"] = db.query(ChatHistory).filter(
+            ChatHistory.role == "user").count()
+        result["messages_today"] = db.query(ChatHistory).filter(
+            ChatHistory.role == "user",
+            ChatHistory.timestamp >= now - datetime.timedelta(days=1)).count()
+
+        # D7 近似留存：先按用户取首次出现时间，取 7-10 天前的新客，看最近 3 天是否回流
+        first_seen = dict(db.query(
+            EventLog.client_id, func.min(EventLog.created_at)
+        ).group_by(EventLog.client_id).all())
+        cohort = [cid for cid, ts in first_seen.items()
+                  if ts and datetime.timedelta(days=7) <= now - ts <= datetime.timedelta(days=10)]
+        result["d7_cohort_size"] = len(cohort)
+        if cohort:
+            active = (db.query(func.count(func.distinct(EventLog.client_id)))
+                      .filter(EventLog.client_id.in_(cohort),
+                              EventLog.created_at >= now - datetime.timedelta(days=3))
+                      .scalar())
+            result["d7_retention_rate"] = round(active / len(cohort), 3)
+
+        result["crisis_flags_30d"] = db.query(EventLog).filter(
+            EventLog.event == "crisis_flag",
+            EventLog.created_at >= now - datetime.timedelta(days=30)).count()
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        db.close()
+    return result
+
+
 # ================= 5. 记忆管理接口 =================
 @app.get("/api/memories")
 def list_memories():
@@ -926,6 +1026,12 @@ def chat(request: ChatRequest):
                                    content=request.user_message, affection=current_affection)
             db.add(user_msg)
             db.commit()
+
+            # 北极星指标：服务端消息埋点 + 危机信号检测（只记事件，不记内容）
+            log_event(request.client_id, "message_sent", char_id)
+            if any(k in request.user_message for k in CRISIS_KEYWORDS):
+                log_event(request.client_id, "crisis_flag", char_id)
+                print("[metrics] ⚠️ 检测到危机信号，已记录事件", flush=True)
 
             recent_records = (db.query(ChatHistory)
                               .filter(ChatHistory.character == char_id)
