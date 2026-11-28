@@ -10,6 +10,7 @@ import traceback
 import edge_tts
 import re
 import random
+import hashlib
 import requests
 import json
 import datetime
@@ -442,9 +443,69 @@ def _sf_tts(text_value: str, full_path: str, char_config: dict) -> bool:
         return False
 
 
+def ds_tts_key() -> str:
+    """阿里百炼 API Key，请求时动态读取"""
+    return (os.getenv("DASHSCOPE_API_KEY") or "").strip()
+
+
+def _ds_tts(text_value: str, full_path: str, voice: str, model: str = "cosyvoice-v2",
+            rate: float = None, pitch: float = None, volume: int = None) -> bool:
+    """阿里百炼 CosyVoice 合成（60+ 性格化预置音色，支持音调调节）"""
+    import base64 as _b64
+    key = ds_tts_key()
+    if not key or not voice:
+        return False
+    workspace = (os.getenv("DASHSCOPE_WORKSPACE_ID") or "").strip()
+    if workspace:
+        url = f"https://{workspace}.cn-beijing.maas.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer"
+    else:
+        url = "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer"
+    inp = {"text": text_value, "voice": voice, "format": "mp3", "sample_rate": 44100}
+    if rate:
+        inp["rate"] = float(rate)
+    if pitch:
+        inp["pitch"] = float(pitch)
+    if volume:
+        inp["volume"] = int(volume)
+    try:
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            json={"model": model, "input": inp},
+            timeout=60)
+        resp.raise_for_status()
+        audio = (resp.json().get("output") or {}).get("audio")
+        if isinstance(audio, dict) and audio.get("url"):
+            dl = requests.get(audio["url"], timeout=60)
+            dl.raise_for_status()
+            content = dl.content
+        elif isinstance(audio, str) and len(audio) > 100:
+            content = _b64.b64decode(audio)
+        else:
+            raise RuntimeError(f"响应无音频: {str(resp.json())[:200]}")
+        if len(content) < 1000:
+            raise RuntimeError(f"音频过短({len(content)}B)")
+        with open(full_path, "wb") as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        print(f"[tts] DashScope 失败: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
 def run_tts_in_thread(text_value, filename, char_config):
-    """优先 CosyVoice2（拟人），未配置 key 或失败时回退 Edge-TTS（免费）"""
+    """引擎优先级：百炼 CosyVoice > SiliconFlow CosyVoice2 > Edge-TTS（免费兜底）"""
     def target():
+        try:
+            if char_config.get("ds_voice") and _ds_tts(
+                    text_value, filename, char_config["ds_voice"],
+                    char_config.get("ds_model", "cosyvoice-v2"),
+                    char_config.get("ds_rate"), char_config.get("ds_pitch"),
+                    char_config.get("ds_volume")):
+                return
+        except Exception as e:
+            print(f"[tts] DashScope 异常: {e}", flush=True)
         try:
             if _sf_tts(text_value, filename, char_config):
                 return
@@ -633,6 +694,7 @@ def db_check():
                                   and os.getenv("STRIPE_PRICE_ID")),
         "search_configured": bool(tavily_key()),
         "tts_configured": bool(sf_tts_key()),
+        "ds_tts_configured": bool(ds_tts_key()),
         "style_samples": len(STYLE_SAMPLES),
     }
     if not DB_READY or not SessionLocal:
@@ -1214,7 +1276,12 @@ def voice_preview(char_id: str):
     config = CHARACTERS.get(char_id)
     if not config:
         return {"status": "error", "message": "角色不存在"}
-    provider = "cosy" if sf_tts_key() else "edge"
+    if ds_tts_key():
+        provider = "ds"
+    elif sf_tts_key():
+        provider = "cosy"
+    else:
+        provider = "edge"
     filename = f"preview_{char_id}_{provider}.mp3"
     full_path = os.path.join(AUDIO_DIR, filename)
     try:
@@ -1225,3 +1292,26 @@ def voice_preview(char_id: str):
     except Exception as e:
         print(f"[voice-preview] 生成失败: {e}", flush=True)
     return {"status": "error", "message": "试听生成失败"}
+
+
+class AuditionRequest(BaseModel):
+    voice: str
+    model: str = "cosyvoice-v2"
+    text: str = ""
+    rate: float = None
+    pitch: float = None
+
+
+@app.post("/api/tts-audition")
+def tts_audition(req: AuditionRequest):
+    """按任意百炼音色合成试听片段，用于音色选型（参数组合做缓存键）"""
+    if not ds_tts_key():
+        return {"status": "error", "message": "DASHSCOPE_API_KEY 未配置"}
+    text = (req.text or "").strip() or "这件事你心里早就有答案了，只是缺人替你把最后一层窗户纸捅破。说吧，我听着。"
+    tag = hashlib.md5(f"{req.voice}|{req.model}|{req.rate}|{req.pitch}|{text}".encode()).hexdigest()[:12]
+    full_path = os.path.join(AUDIO_DIR, f"audition_{tag}.mp3")
+    if not os.path.isfile(full_path):
+        ok = _ds_tts(text, full_path, req.voice, req.model, req.rate, req.pitch)
+        if not ok:
+            return {"status": "error", "message": f"音色 {req.voice}（{req.model}）合成失败，可能该音色不支持此模型"}
+    return FileResponse(full_path, media_type="audio/mpeg")
