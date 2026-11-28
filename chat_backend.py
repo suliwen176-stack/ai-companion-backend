@@ -1363,14 +1363,11 @@ def voice_preview(char_id: str, variant: str = "main"):
     config = CHARACTERS.get(char_id)
     if not config:
         return {"status": "error", "message": "角色不存在"}
-    if ds_tts_key():
-        provider = "ds"
-    elif sf_tts_key():
-        provider = "cosy"
-    else:
-        provider = "edge"
+    # 缓存键绑定当前 API key 指纹：换 key / 修好 key 后自动重新合成，
+    # 避免「百炼失败回退 Edge 的旧音频」被当成百炼结果长期缓存。
+    key_fp = hashlib.md5((ds_tts_key() + "|" + sf_tts_key()).encode()).hexdigest()[:8]
     vtag = variant if variant in ("main", "alt") else "main"
-    filename = f"preview_{char_id}_{vtag}_{provider}.mp3"
+    filename = f"preview_{char_id}_{vtag}_{key_fp}.mp3"
     full_path = os.path.join(AUDIO_DIR, filename)
     try:
         if not os.path.isfile(full_path):
