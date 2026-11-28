@@ -7,6 +7,8 @@ import asyncio
 import threading
 import tempfile
 import traceback
+import base64
+import hmac
 import edge_tts
 import re
 import random
@@ -64,7 +66,8 @@ def _build_engine():
         url,
         pool_pre_ping=True,     # 免费实例闲置断连后自动重连
         pool_recycle=300,
-        connect_args={"connect_timeout": 10},
+        # connect_timeout 是 Postgres 驱动参数；SQLite（本地测试）不认识
+        connect_args={"connect_timeout": 10} if url.startswith("postgresql") else {},
     )
 
 
@@ -83,6 +86,8 @@ class ChatHistory(Base):
     content = Column(Text)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
     affection = Column(Integer, default=50)
+    # 数据归属：登录用户的 client_id（u{id}）；旧行为 NULL，仅对未登录时代可见
+    client_id = Column(String, index=True)
 
 
 class UserMemory(Base):
@@ -92,6 +97,18 @@ class UserMemory(Base):
     category = Column(String, default="preference")
     content = Column(Text, nullable=False)
     source = Column(String, default="manual")   # seed / manual / auto
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    # 数据归属：登录用户的 client_id；旧行为 NULL（全局示例记忆）
+    client_id = Column(String, index=True)
+
+
+class User(Base):
+    """账号：手机号 + 密码。client_id 是该账号所有数据的归属键"""
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String, unique=True, index=True)
+    password_hash = Column(String)          # pbkdf2$iter$salt$hash
+    client_id = Column(String, unique=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
@@ -134,19 +151,20 @@ SEED_MEMORIES = [
 ]
 
 
-def seed_memories():
-    if not DB_READY or not SessionLocal:
+def seed_memories(client_id: str):
+    """新账号注册时播种示例记忆（数据挂在本人名下，可自行删改）"""
+    if not DB_READY or not SessionLocal or not client_id:
         return
     db = SessionLocal()
     try:
-        if db.query(UserMemory).count() == 0:
-            for category, content in SEED_MEMORIES:
-                db.add(UserMemory(category=category, content=content, source="seed"))
-            db.commit()
-            print(f"[startup] 已播种 {len(SEED_MEMORIES)} 条初始记忆", flush=True)
+        for category, content in SEED_MEMORIES:
+            db.add(UserMemory(category=category, content=content,
+                              source="seed", client_id=client_id))
+        db.commit()
+        print(f"[startup] 已为 {client_id} 播种 {len(SEED_MEMORIES)} 条初始记忆", flush=True)
     except Exception as e:
         db.rollback()
-        print(f"[startup] 记忆播种失败（不影响聊天）: {e}", flush=True)
+        print(f"[startup] 记忆播种失败（不影响注册）: {e}", flush=True)
     finally:
         db.close()
 
@@ -158,14 +176,216 @@ try:
         conn.execute(text("SELECT 1"))
     # 只创建不存在的表，不会破坏已有的 chat_history
     Base.metadata.create_all(bind=engine)
+    # 轻量列迁移：给旧表补 client_id 列（数据归属键）；列已存在则跳过
+    with engine.connect() as conn:
+        for _table in ("chat_history", "user_memories"):
+            try:
+                conn.execute(text(
+                    f"ALTER TABLE {_table} ADD COLUMN client_id VARCHAR"))
+                conn.commit()
+                print(f"[startup] 已为 {_table} 补充 client_id 列", flush=True)
+            except Exception:
+                conn.rollback()   # 列已存在或其他 benign 情况，忽略
     DB_READY = True
     print(f"[startup] ✅ Supabase 已连接 -> {engine.url.host}/{engine.url.database} "
           f"(driver={engine.url.drivername})", flush=True)
-    seed_memories()
 except Exception as e:
     DB_ERROR = f"{type(e).__name__}: {e}"
     print(f"[startup] ❌ 数据库连接失败，聊天记录将无法持久化！\n{DB_ERROR}\n"
           f"{traceback.format_exc()}", flush=True)
+
+
+# ================= 1.5 账号与登录 =================
+PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
+TOKEN_TTL = 30 * 86400          # token 有效期 30 天
+PBKDF2_ITER = 100_000
+# 登录限流（内存级，重启清零）：连续失败 5 次锁定 15 分钟
+_LOGIN_ATTEMPTS = {}
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCK_SECONDS = 900
+
+
+def _auth_secret() -> bytes:
+    """token 签名密钥：优先 AUTH_SECRET 环境变量；未配置时从 DATABASE_URL
+    派生稳定值（重启不失效），但建议在 Render 中显式设置 AUTH_SECRET"""
+    s = (os.getenv("AUTH_SECRET") or "").strip()
+    if not s:
+        s = "derived:" + hashlib.sha256(
+            (os.getenv("DATABASE_URL") or "local-dev").encode()).hexdigest()
+    return s.encode()
+
+
+def hash_password(pw: str) -> str:
+    salt = os.urandom(16).hex()
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt),
+                                 PBKDF2_ITER).hex()
+    return f"pbkdf2${PBKDF2_ITER}${salt}${digest}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    try:
+        _, it, salt, digest = (stored or "").split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt),
+                                   int(it)).hex()
+        return hmac.compare_digest(calc, digest)
+    except Exception:
+        return False
+
+
+def make_token(user_id: int) -> str:
+    payload = {"uid": user_id, "exp": int(time.time()) + TOKEN_TTL}
+    body = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    sig = hmac.new(_auth_secret(), body.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{body}.{sig}"
+
+
+def parse_token(token: str):
+    """校验 token，返回 user_id；无效/过期返回 None"""
+    try:
+        body, sig = (token or "").split(".", 1)
+        expect = hmac.new(_auth_secret(), body.encode(), hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(sig, expect):
+            return None
+        pad = "=" * (-len(body) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(body + pad))
+        if int(payload.get("exp", 0)) < time.time():
+            return None
+        return int(payload.get("uid", 0)) or None
+    except Exception:
+        return None
+
+
+def require_user(request: Request):
+    """从 Authorization: Bearer 头解析当前用户；失败抛 401"""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="请先登录")
+    uid = parse_token(auth[7:].strip())
+    if not uid or not (DB_READY and SessionLocal):
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == uid).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="账号不存在")
+        return user
+    finally:
+        db.close()
+
+
+def _login_gate(phone: str):
+    """返回剩余锁定秒数（0 = 放行）"""
+    rec = _LOGIN_ATTEMPTS.get(phone)
+    if rec and rec["locked_until"] > time.time():
+        return int(rec["locked_until"] - time.time())
+    return 0
+
+
+def _login_fail(phone: str):
+    rec = _LOGIN_ATTEMPTS.setdefault(phone, {"fails": 0, "locked_until": 0})
+    rec["fails"] += 1
+    if rec["fails"] >= LOGIN_MAX_FAILS:
+        rec["locked_until"] = time.time() + LOGIN_LOCK_SECONDS
+        rec["fails"] = 0
+
+
+def _login_ok(phone: str):
+    _LOGIN_ATTEMPTS.pop(phone, None)
+
+
+class AuthRequest(BaseModel):
+    phone: str
+    password: str
+
+
+def _validate_phone_password(phone: str, password: str):
+    if not PHONE_RE.match(phone or ""):
+        return "请输入正确的 11 位大陆手机号"
+    if not password or len(password) < 8:
+        return "密码至少 8 位"
+    if len(password) > 64:
+        return "密码最长 64 位"
+    return ""
+
+
+@app.post("/api/auth/register")
+def auth_register(req: AuthRequest):
+    err = _validate_phone_password(req.phone, req.password)
+    if err:
+        return {"status": "error", "message": err}
+    if not (DB_READY and SessionLocal):
+        return {"status": "error", "message": "数据库未就绪，请稍后再试"}
+    phone = req.phone.strip()
+    gate = _login_gate(phone)
+    if gate:
+        return {"status": "error", "message": f"尝试过于频繁，请 {max(gate // 60, 1)} 分钟后再试"}
+    db = SessionLocal()
+    try:
+        if db.query(User).filter(User.phone == phone).first():
+            return {"status": "error", "message": "该手机号已注册，请直接登录"}
+        user = User(phone=phone, password_hash=hash_password(req.password))
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        user.client_id = f"u{user.id}"
+        db.commit()
+        seed_memories(user.client_id)
+        log_event(user.client_id, "register")
+        print(f"[auth] 注册成功: {phone[:3]}****{phone[-4:]} -> {user.client_id}", flush=True)
+        return {"status": "success", "token": make_token(user.id),
+                "phone": phone, "client_id": user.client_id}
+    except Exception as e:
+        db.rollback()
+        print(f"[auth] 注册失败: {traceback.format_exc()}", flush=True)
+        return {"status": "error", "message": "注册失败，请稍后再试"}
+    finally:
+        db.close()
+
+
+@app.post("/api/auth/login")
+def auth_login(req: AuthRequest):
+    err = _validate_phone_password(req.phone, req.password)
+    if err:
+        return {"status": "error", "message": err}
+    if not (DB_READY and SessionLocal):
+        return {"status": "error", "message": "数据库未就绪，请稍后再试"}
+    phone = req.phone.strip()
+    gate = _login_gate(phone)
+    if gate:
+        return {"status": "error", "message": f"尝试过于频繁，请 {max(gate // 60, 1)} 分钟后再试"}
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.phone == phone).first()
+        if not user or not verify_password(req.password, user.password_hash):
+            _login_fail(phone)
+            return {"status": "error", "message": "手机号或密码错误"}
+        _login_ok(phone)
+        log_event(user.client_id, "login")
+        print(f"[auth] 登录成功: {phone[:3]}****{phone[-4:]}", flush=True)
+        return {"status": "success", "token": make_token(user.id),
+                "phone": phone, "client_id": user.client_id}
+    finally:
+        db.close()
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    user = require_user(request)
+    return {"status": "success", "phone": user.phone, "client_id": user.client_id}
+
+
+class SendCodeRequest(BaseModel):
+    phone: str
+
+
+@app.post("/api/auth/send-code")
+def auth_send_code(req: SendCodeRequest):
+    """短信验证码占位：待阿里云短信签名/模板审核通过后接入真实发送"""
+    if not PHONE_RE.match(req.phone or ""):
+        return {"status": "error", "message": "请输入正确的 11 位大陆手机号"}
+    return {"status": "error", "code": "SMS_NOT_READY",
+            "message": "短信服务即将开通，请先使用密码登录"}
 
 
 # ================= 2. 工具与人设 =================
@@ -819,13 +1039,17 @@ FREE_MEMORY_LIMIT = int(os.getenv("FREE_MEMORY_LIMIT", "8"))
 AUTO_EXTRACT = os.getenv("AUTO_EXTRACT_MEMORIES", "true").lower() == "true"
 
 
-def get_all_memories():
-    """返回按分类分组的记忆，供接口与 system prompt 共用"""
+def get_all_memories(client_id: str = ""):
+    """返回按分类分组的记忆，供接口与 system prompt 共用
+    client_id 提供时只取该用户名下的记忆（数据隔离）"""
     if not DB_READY or not SessionLocal:
         return [], {}
     db = SessionLocal()
     try:
-        rows = db.query(UserMemory).order_by(UserMemory.id.asc()).all()
+        q = db.query(UserMemory).order_by(UserMemory.id.asc())
+        if client_id:
+            q = q.filter(UserMemory.client_id == client_id)
+        rows = q.all()
         items = [{"id": r.id, "category": r.category, "content": r.content,
                   "source": r.source, "created_at": str(r.created_at)} for r in rows]
         groups = {}
@@ -843,11 +1067,11 @@ def _content_bigrams(s: str) -> set:
 
 
 def build_system_prompt(char_id: str = DEFAULT_CHAR_ID, user_message: str = "",
-                        mode: str = "neutral"):
+                        mode: str = "neutral", client_id: str = ""):
     """角色人设 + 相关性记忆 + 说话风格锚点 + 模式姿态，动态拼装"""
     char_config = CHARACTERS.get(char_id, CHARACTERS[DEFAULT_CHAR_ID])
     base = BASE_PROMPT + "\n\n【你的角色（必须始终以这个身份说话）】\n" + char_config["persona"]
-    items, groups = get_all_memories()
+    items, groups = get_all_memories(client_id)
     if items:
         # 记忆按相关性挑选而非全量注入：身份/偏好类常驻，其余按与当前消息的重叠度取
         # 高相关 + 最近新增的几条，避免每次都背同一套清单
@@ -933,7 +1157,8 @@ def extract_memories_async(user_text: str, client_id: str = ""):
             return
         db = SessionLocal()
         try:
-            existing = {r.content.strip() for r in db.query(UserMemory).all()}
+            existing = {r.content.strip() for r in db.query(UserMemory)
+                        .filter(UserMemory.client_id == client_id).all()}
             pro = is_pro(client_id)
             # 免费版与手动添加共用同一条数上限，Pro 解锁无限
             if not pro and len(existing) >= FREE_MEMORY_LIMIT:
@@ -950,7 +1175,8 @@ def extract_memories_async(user_text: str, client_id: str = ""):
                     category = "other"
                 if not content or len(content) > 120 or content in existing:
                     continue
-                db.add(UserMemory(category=category, content=content, source="auto"))
+                db.add(UserMemory(category=category, content=content, source="auto",
+                                  client_id=client_id))
                 existing.add(content)
                 added += 1
             db.commit()
@@ -1200,18 +1426,20 @@ def metrics():
 
 # ================= 5. 记忆管理接口 =================
 @app.get("/api/memories")
-def list_memories():
+def list_memories(request: Request):
+    user = require_user(request)
     if not DB_READY:
         return {"status": "error", "message": "数据库未就绪", "memories": [],
                 "groups": {}, "labels": CATEGORY_LABELS, "total": 0}
-    items, groups = get_all_memories()
+    items, groups = get_all_memories(user.client_id)
     return {"status": "success", "memories": items, "groups": groups,
             "labels": CATEGORY_LABELS, "total": len(items),
             "limit": FREE_MEMORY_LIMIT}
 
 
 @app.post("/api/memories")
-def add_memory(req: MemoryCreate, client_id: str = ""):
+def add_memory(req: MemoryCreate, request: Request):
+    user = require_user(request)
     if not DB_READY or not SessionLocal:
         return {"status": "error", "message": "数据库未就绪，无法保存记忆"}
     content = (req.content or "").strip()
@@ -1227,15 +1455,20 @@ def add_memory(req: MemoryCreate, client_id: str = ""):
     category = req.category if req.category in VALID_CATEGORIES else "other"
     db = SessionLocal()
     try:
-        count = db.query(UserMemory).count()
+        count = db.query(UserMemory).filter(
+            UserMemory.client_id == user.client_id).count()
         # Free 用户有记忆条数上限，Pro 解锁无限
-        if not is_pro(client_id) and count >= FREE_MEMORY_LIMIT:
+        if not is_pro(user.client_id) and count >= FREE_MEMORY_LIMIT:
             return {"status": "error", "code": "LIMIT_REACHED",
                     "message": f"免费版最多保存 {FREE_MEMORY_LIMIT} 条记忆，升级 Pro 可解锁无限记忆",
                     "limit": FREE_MEMORY_LIMIT}
-        if any(r.content.strip() == content for r in db.query(UserMemory).all()):
+        dup = (db.query(UserMemory)
+               .filter(UserMemory.client_id == user.client_id,
+                       UserMemory.content == content).first())
+        if dup:
             return {"status": "error", "message": "这条记忆已经存在啦"}
-        row = UserMemory(category=category, content=content, source="manual")
+        row = UserMemory(category=category, content=content, source="manual",
+                         client_id=user.client_id)
         db.add(row)
         db.commit()
         return {"status": "success",
@@ -1251,12 +1484,15 @@ def add_memory(req: MemoryCreate, client_id: str = ""):
 
 
 @app.delete("/api/memories/{memory_id}")
-def delete_memory(memory_id: int):
+def delete_memory(memory_id: int, request: Request):
+    user = require_user(request)
     if not DB_READY or not SessionLocal:
         return {"status": "error", "message": "数据库未就绪"}
     db = SessionLocal()
     try:
-        row = db.query(UserMemory).filter(UserMemory.id == memory_id).first()
+        row = (db.query(UserMemory)
+               .filter(UserMemory.id == memory_id,
+                       UserMemory.client_id == user.client_id).first())
         if not row:
             return {"status": "error", "message": "记忆不存在"}
         db.delete(row)
@@ -1270,14 +1506,16 @@ def delete_memory(memory_id: int):
 
 
 @app.get("/api/history")
-def get_history(limit: int = 30, character_id: str = DEFAULT_CHAR_ID):
-    """前端启动时加载历史消息，直观呈现「永久记忆」与每日早安"""
+def get_history(request: Request, limit: int = 30, character_id: str = DEFAULT_CHAR_ID):
+    """前端启动时加载历史消息（仅本人 + 每日早安），直观呈现「永久记忆」"""
+    user = require_user(request)
     if not DB_READY or not SessionLocal:
         return {"status": "success", "messages": []}
     db = SessionLocal()
     try:
         rows = (db.query(ChatHistory)
                 .filter(ChatHistory.character == character_id,
+                        ChatHistory.client_id == user.client_id,
                         ChatHistory.content.isnot(None))
                 .order_by(ChatHistory.id.desc()).limit(min(max(limit, 1), 100)).all())
         rows.reverse()
@@ -1295,10 +1533,10 @@ def get_history(limit: int = 30, character_id: str = DEFAULT_CHAR_ID):
 CRON_SECRET = os.getenv("CRON_SECRET", "")
 
 
-def generate_greeting_text():
+def generate_greeting_text(client_id: str = ""):
     """结合长期记忆生成个性化早安问候，失败时兜底固定文案"""
     facts = []
-    items, groups = get_all_memories()
+    items, groups = get_all_memories(client_id)
     for key in ("goal", "learning", "life"):
         for m in groups.get(key, []):
             facts.append(m["content"])
@@ -1321,28 +1559,33 @@ def generate_greeting_text():
     return "【早安】早。今天想从哪儿开始？"
 
 
-def daily_reflection():
+def daily_reflection(client_id: str = ""):
     """每日反思：回顾最近 24 小时对话，把新的用户画像事实沉淀进长期记忆。
-    这是「心智模型」的增量更新通道——逐条自动抽取管当下，每日反思管全局。"""
+    这是「心智模型」的增量更新通道——逐条自动抽取管当下，每日反思管全局。
+    多账号后按 client_id 逐人执行，记忆互不污染。"""
     if not (DB_READY and SessionLocal):
         return {"status": "error", "message": "数据库未就绪", "added": 0}
     db = SessionLocal()
     try:
         since = datetime.datetime.utcnow() - datetime.timedelta(hours=24)
-        rows = (db.query(ChatHistory)
-                .filter(ChatHistory.character == "girl",
-                        ChatHistory.timestamp >= since,
-                        ChatHistory.content.isnot(None),
-                        ~ChatHistory.content.startswith("【早安】"))
-                .order_by(ChatHistory.id.asc()).all())
+        q = (db.query(ChatHistory)
+             .filter(ChatHistory.character == "girl",
+                     ChatHistory.timestamp >= since,
+                     ChatHistory.content.isnot(None),
+                     ~ChatHistory.content.startswith("【早安】")))
+        if client_id:
+            q = q.filter(ChatHistory.client_id == client_id)
+        rows = q.order_by(ChatHistory.id.asc()).all()
         if not rows:
             return {"status": "success", "message": "最近24小时没有对话，无需反思", "added": 0}
         transcript = "\n".join(
             f"{'她' if r.role == 'user' else '你'}：{(r.content or '')[:200]}"
             for r in rows[-40:])
-        existing = [r.content.strip() for r in db.query(UserMemory).all()]
-        has_pro = db.query(ProSubscription).filter(
-            ProSubscription.status == "active").first() is not None
+        mem_q = db.query(UserMemory)
+        if client_id:
+            mem_q = mem_q.filter(UserMemory.client_id == client_id)
+        existing = [r.content.strip() for r in mem_q.all()]
+        has_pro = is_pro(client_id) if client_id else False
         reflect_prompt = """你是用户画像反思器。下面是过去24小时用户和 AI 的对话。
 提炼「关于用户本人的新的长期事实」，尤其注意：
 - 事件状态(event)：她正在熬的事、未完成的事、卡壳或推进的节点。写法要带状态，如「面试定在周四上午」「和领导谈薪还没执行」。
@@ -1381,9 +1624,13 @@ def daily_reflection():
                 category = "other"
             if not content or len(content) > 120 or content in existing_set:
                 continue
-            if not has_pro and db.query(UserMemory).count() >= FREE_MEMORY_LIMIT:
+            mem_count_q = db.query(UserMemory)
+            if client_id:
+                mem_count_q = mem_count_q.filter(UserMemory.client_id == client_id)
+            if not has_pro and mem_count_q.count() >= FREE_MEMORY_LIMIT:
                 break
-            db.add(UserMemory(category=category, content=content, source="reflection"))
+            db.add(UserMemory(category=category, content=content, source="reflection",
+                              client_id=client_id))
             existing_set.add(content)
             added += 1
         db.commit()
@@ -1401,28 +1648,46 @@ def daily_reflection():
 @app.api_route("/api/cron/morning-greeting", methods=["GET", "POST"])
 def morning_greeting(secret: str = ""):
     """由 Render Cron Job 或外部定时器调用；GET 便于手工/外部 cron 触发
-    每次执行：生成早安问候 + 每日反思（沉淀用户画像）"""
+    每次执行：为每个账号生成早安问候 + 每日反思（沉淀用户画像，互不污染）"""
     if CRON_SECRET and secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="无效的 CRON_SECRET")
     if not DB_READY or not SessionLocal:
         return {"status": "error", "message": "数据库未就绪，问候未写入"}
-    greeting = generate_greeting_text()
-    reflection = daily_reflection()
     db = SessionLocal()
+    results = []
     try:
-        db.add(ChatHistory(character="girl", role="assistant",
-                           content=greeting, affection=50))
-        db.commit()
-        print(f"[cron] 早安问候已写入: {greeting}", flush=True)
-        return {"status": "success", "greeting": greeting,
-                "reflection": reflection,
+        users = db.query(User).all()
+        db.close()
+        for u in users:
+            cid = u.client_id
+            try:
+                greeting = generate_greeting_text(cid)
+                reflection = daily_reflection(cid)
+                db2 = SessionLocal()
+                try:
+                    db2.add(ChatHistory(character="girl", role="assistant",
+                                        content=greeting, affection=50,
+                                        client_id=cid))
+                    db2.commit()
+                finally:
+                    db2.close()
+                print(f"[cron] 早安已写入 {cid}: {greeting[:30]}...", flush=True)
+                results.append({"client_id": cid, "greeting": greeting,
+                                "reflection": reflection})
+            except Exception as ue:
+                print(f"[cron] {cid} 问候/反思失败: {ue}", flush=True)
+                results.append({"client_id": cid, "error": str(ue)})
+        return {"status": "success", "users": len(results),
+                "results": results,
                 "time_utc": datetime.datetime.utcnow().isoformat()}
     except Exception as e:
-        db.rollback()
         print(f"[cron] 写入失败: {traceback.format_exc()}", flush=True)
         return {"status": "error", "message": str(e)}
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 # ================= 7. Stripe 订阅支付 =================
@@ -1518,8 +1783,9 @@ async def stripe_webhook(request: Request):
 
 
 @app.get("/api/subscription/status")
-def subscription_status(client_id: str = ""):
-    pro = is_pro(client_id)
+def subscription_status(request: Request):
+    user = require_user(request)
+    pro = is_pro(user.client_id)
     return {"status": "success", "is_pro": pro,
             "plan": "pro" if pro else "free",
             "price": "$7.99/月",
@@ -1529,7 +1795,9 @@ def subscription_status(client_id: str = ""):
 
 # ================= 8. 核心聊天逻辑 =================
 @app.post("/api/chat")
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, http_request: Request):
+    user = require_user(http_request)
+    cid = user.client_id
     char_id = request.character_id if request.character_id in CHARACTERS else DEFAULT_CHAR_ID
     char_config = CHARACTERS[char_id]
     # 双模式：显式换挡优先，否则按语义+时段自动识别
@@ -1555,29 +1823,33 @@ def chat(request: ChatRequest):
         recent_records = []
         if db:
             last_record = (db.query(ChatHistory)
-                           .filter(ChatHistory.character == char_id)
+                           .filter(ChatHistory.character == char_id,
+                                   ChatHistory.client_id == cid)
                            .order_by(ChatHistory.id.desc()).first())
             current_affection = last_record.affection if last_record else 50
 
             user_msg = ChatHistory(character=char_id, role="user",
                                    content=request.user_message + ("（发了一张照片）" if request.image_data else ""),
-                                   affection=current_affection)
+                                   affection=current_affection,
+                                   client_id=cid)
             db.add(user_msg)
             db.commit()
 
             # 北极星指标：服务端消息埋点（含模式）+ 危机信号检测（只记事件，不记内容）
-            log_event(request.client_id, "message_sent", f"{char_id}|mode={mode}")
+            log_event(cid, "message_sent", f"{char_id}|mode={mode}")
             if any(k in request.user_message for k in CRISIS_KEYWORDS):
-                log_event(request.client_id, "crisis_flag", char_id)
+                log_event(cid, "crisis_flag", char_id)
                 print("[metrics] ⚠️ 检测到危机信号，已记录事件", flush=True)
 
             recent_records = (db.query(ChatHistory)
-                              .filter(ChatHistory.character == char_id)
+                              .filter(ChatHistory.character == char_id,
+                                      ChatHistory.client_id == cid)
                               .order_by(ChatHistory.id.desc()).limit(8).all())
             recent_records.reverse()
 
         # 人设 + 结构化长期记忆 + 风格锚点 + 模式姿态动态拼装
-        messages = [{"role": "system", "content": build_system_prompt(char_id, request.user_message, mode)}]
+        messages = [{"role": "system", "content": build_system_prompt(
+            char_id, request.user_message, mode, client_id=cid)}]
         for record in recent_records:
             # 跳过空内容与每日早安（早安是主动陪伴消息，不当作对话上下文）
             if record.content and not record.content.startswith("【早安】"):
@@ -1625,7 +1897,8 @@ def chat(request: ChatRequest):
 
         if db:
             ai_msg = ChatHistory(character=char_id, role="assistant",
-                                 content=reply, affection=new_affection)
+                                 content=reply, affection=new_affection,
+                                 client_id=cid)
             db.add(ai_msg)
             db.commit()
 
@@ -1637,8 +1910,8 @@ def chat(request: ChatRequest):
             full_path = os.path.join(AUDIO_DIR, audio_filename)
             tts_config = dict(char_config)
             voice_override = None
-            if request.cloned_voice and request.client_id:
-                voice_override = get_cloned_voice(request.client_id)
+            if request.cloned_voice and cid:
+                voice_override = get_cloned_voice(cid)
             if voice_override:
                 # 复刻音色天然比预置音色语速慢、连贯性弱（短样本克隆的固有特性）：
                 # 放慢幅度减半，常态下还略微提速，避免"太慢、不连贯、不像正常人"
@@ -1664,7 +1937,7 @@ def chat(request: ChatRequest):
         # 异步抽取长期记忆，不阻塞响应
         try:
             threading.Thread(target=extract_memories_async,
-                             args=(request.user_message, request.client_id),
+                             args=(request.user_message, cid),
                              daemon=True).start()
         except Exception:
             pass
@@ -1676,7 +1949,7 @@ def chat(request: ChatRequest):
             "audio_url": audio_url,
             "affection": new_affection,
             "db_persisted": bool(db),
-            "is_pro": is_pro(request.client_id),
+            "is_pro": is_pro(cid),
             "mode": mode,
         }
     except Exception as e:
@@ -1697,8 +1970,10 @@ def api_asr(request: AsrRequest):
 
 
 @app.post("/api/voice-clone")
-def api_voice_clone(request: CloneRequest):
+def api_voice_clone(request: CloneRequest, http_request: Request):
     """声音复刻：10-20 秒清晰人声样本 → 自定义音色（约 10-20 秒完成，创建免费）"""
+    user = require_user(http_request)
+    cid = user.client_id
     key = ds_tts_key()
     if not key:
         raise HTTPException(status_code=503, detail="声音复刻未配置（缺少 DASHSCOPE_API_KEY）")
@@ -1710,7 +1985,7 @@ def api_voice_clone(request: CloneRequest):
     base = (f"https://{workspace}.cn-beijing.maas.aliyuncs.com/api/v1" if workspace
             else "https://dashscope.aliyuncs.com/api/v1")
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    prefix = re.sub(r'[^a-zA-Z0-9]', '', request.client_id)[:10] or "voice"
+    prefix = re.sub(r'[^a-zA-Z0-9]', '', cid)[:10] or "voice"
     try:
         r = requests.post(
             f"{base}/services/audio/tts/customization", headers=headers,
@@ -1747,8 +2022,8 @@ def api_voice_clone(request: CloneRequest):
     if DB_READY and SessionLocal:
         db = SessionLocal()
         try:
-            db.query(VoiceProfile).filter(VoiceProfile.client_id == request.client_id).delete()
-            db.add(VoiceProfile(client_id=request.client_id, voice_id=voice_id))
+            db.query(VoiceProfile).filter(VoiceProfile.client_id == cid).delete()
+            db.add(VoiceProfile(client_id=cid, voice_id=voice_id))
             db.commit()
         finally:
             db.close()
