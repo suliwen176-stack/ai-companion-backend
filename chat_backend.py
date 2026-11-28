@@ -477,6 +477,12 @@ class ChatRequest(BaseModel):
     character_id: str = "girl"
     client_id: str = ""
     voice_variant: str = "main"
+    mode: str = "auto"
+    image_data: str = ""  # data:image/...;base64,...，可为空
+
+
+class AsrRequest(BaseModel):
+    audio: str  # data:audio/...;base64,...
     mode: str = "auto"          # auto（自动识别）/ push（理思路）/ hold（随便聊聊）
 
 
@@ -539,6 +545,79 @@ def _sf_tts(text_value: str, full_path: str, char_config: dict) -> bool:
 def ds_tts_key() -> str:
     """阿里百炼 API Key，请求时动态读取"""
     return _clean_key(os.getenv("DASHSCOPE_API_KEY"))
+
+
+# ================= 4.4 多模态：图片理解 + 服务端语音识别（百炼兼容端点） =================
+DS_COMPAT_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+MAX_IMAGE_B64 = 6_000_000   # data URL 字符数上限（约 4MB 原图）
+MAX_AUDIO_B64 = 10_000_000  # qwen3-asr-flash 编码后上限 10MB
+
+
+def ds_vl_describe(image_data_url: str, user_text: str) -> str:
+    """Qwen-VL 客观描述图片；只产出事实描述，人格化回复仍交给 DeepSeek"""
+    key = ds_tts_key()
+    if not key:
+        return ""
+    try:
+        resp = requests.post(
+            f"{DS_COMPAT_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "model": "qwen3-vl-plus",
+                "messages": [
+                    {"role": "system", "content":
+                        "你是图片描述器。客观描述图片内容，结合用户的话指出与 TA 相关的重点。"
+                        "120字以内，只描述看得见的事实，不要评价、不要安慰、不要替 AI 回复用户。"},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                        {"type": "text", "text": user_text or "（她没有配文字）"},
+                    ]},
+                ],
+                "temperature": 0.3,
+            },
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            return (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        print(f"[vl] 图片描述失败 HTTP {resp.status_code}: {resp.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"[vl] 图片描述异常: {e}", flush=True)
+    return ""
+
+
+def ds_asr(audio_data_url: str) -> str:
+    """Qwen3-ASR-Flash 非实时识别（OpenAI 兼容端点，Base64 Data URI 输入）"""
+    key = ds_tts_key()
+    if not key:
+        raise HTTPException(status_code=503, detail="语音识别未配置（后端缺少 DASHSCOPE_API_KEY）")
+    if not (audio_data_url.startswith("data:audio/") or audio_data_url.startswith("data:video/")):
+        raise HTTPException(status_code=400, detail="音频格式不支持")
+    if len(audio_data_url) > MAX_AUDIO_B64:
+        raise HTTPException(status_code=413, detail="录音过长，请说短一点")
+    try:
+        resp = requests.post(
+            f"{DS_COMPAT_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "model": "qwen3-asr-flash",
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "input_audio", "input_audio": {"data": audio_data_url}},
+                    ]},
+                ],
+                "asr_options": {"language": "zh", "enable_itn": True},
+            },
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            return (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        print(f"[asr] 识别失败 HTTP {resp.status_code}: {resp.text[:200]}", flush=True)
+        raise HTTPException(status_code=502, detail="识别服务暂时不可用，再试一次")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[asr] 识别异常: {e}", flush=True)
+        raise HTTPException(status_code=502, detail="识别服务异常，再试一次")
 
 
 def _ds_tts(text_value: str, full_path: str, voice: str, model: str = "cosyvoice-v2",
@@ -1325,6 +1404,15 @@ def chat(request: ChatRequest):
     # 双模式：显式换挡优先，否则按语义+时段自动识别
     mode = detect_mode(request.user_message, request.mode)
 
+    # 多模态：图片先经 Qwen-VL 客观描述，人格化回复仍由 DeepSeek 完成
+    image_desc = ""
+    if request.image_data:
+        if not request.image_data.startswith("data:image/") or len(request.image_data) > MAX_IMAGE_B64:
+            raise HTTPException(status_code=413, detail="图片过大或不支持，请小于 4MB")
+        image_desc = ds_vl_describe(request.image_data, request.user_message)
+        if image_desc:
+            print(f"[chat] 图片已理解: {image_desc[:60]}...", flush=True)
+
     if not DB_READY or not SessionLocal:
         print("[chat] ⚠️ 数据库未就绪，本轮对话不会被保存", flush=True)
 
@@ -1339,7 +1427,8 @@ def chat(request: ChatRequest):
             current_affection = last_record.affection if last_record else 50
 
             user_msg = ChatHistory(character=char_id, role="user",
-                                   content=request.user_message, affection=current_affection)
+                                   content=request.user_message + ("（发了一张照片）" if request.image_data else ""),
+                                   affection=current_affection)
             db.add(user_msg)
             db.commit()
 
@@ -1360,6 +1449,13 @@ def chat(request: ChatRequest):
             # 跳过空内容与每日早安（早安是主动陪伴消息，不当作对话上下文）
             if record.content and not record.content.startswith("【早安】"):
                 messages.append({"role": record.role, "content": record.content})
+
+        # 把本轮图片的 VL 描述注入当前这条用户消息（图片本身不入库）
+        if image_desc:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i]["role"] == "user":
+                    messages[i]["content"] += f"\n[附：她发了一张照片，内容是：{image_desc}]"
+                    break
 
         tools = build_tools()
 
@@ -1442,6 +1538,13 @@ def chat(request: ChatRequest):
     finally:
         if db:
             db.close()
+
+
+@app.post("/api/asr")
+def api_asr(request: AsrRequest):
+    """服务端语音识别：浏览器录音 base64 → 文字（qwen3-asr-flash）"""
+    text_value = ds_asr(request.audio)
+    return {"status": "success", "text": text_value}
 
 
 # ================= 9. 音频文件 =================
