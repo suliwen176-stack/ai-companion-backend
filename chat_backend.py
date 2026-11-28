@@ -722,6 +722,7 @@ class ChatRequest(BaseModel):
     mode: str = "auto"
     image_data: str = ""  # data:image/...;base64,...，可为空
     cloned_voice: bool = False  # 使用用户复刻的自定义音色
+    voice_enabled: bool = True  # False = 纯文字回复，跳过语音合成
 
 
 class AsrRequest(BaseModel):
@@ -1903,36 +1904,38 @@ def chat(request: ChatRequest, http_request: Request):
             db.commit()
 
         # 语音合成失败不影响聊天与持久化；托底/哄睡模式放慢语速；用户可切换复刻音色
+        # 用户关闭声音（voice_enabled=False）时直接跳过合成，省配额也加快响应
         audio_url = None
-        try:
-            clean_text_for_tts = re.sub(r'\(.*?\)', '', reply).strip()
-            audio_filename = f"voice_{char_id}_{int(datetime.datetime.now().timestamp())}.mp3"
-            full_path = os.path.join(AUDIO_DIR, audio_filename)
-            tts_config = dict(char_config)
-            voice_override = None
-            if request.cloned_voice and cid:
-                voice_override = get_cloned_voice(cid)
-            if voice_override:
-                # 复刻音色天然比预置音色语速慢、连贯性弱（短样本克隆的固有特性）：
-                # 放慢幅度减半，常态下还略微提速，避免"太慢、不连贯、不像正常人"
-                if mode == "story":
-                    tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.95
+        if request.voice_enabled:
+            try:
+                clean_text_for_tts = re.sub(r'\(.*?\)', '', reply).strip()
+                audio_filename = f"voice_{char_id}_{int(datetime.datetime.now().timestamp())}.mp3"
+                full_path = os.path.join(AUDIO_DIR, audio_filename)
+                tts_config = dict(char_config)
+                voice_override = None
+                if request.cloned_voice and cid:
+                    voice_override = get_cloned_voice(cid)
+                if voice_override:
+                    # 复刻音色天然比预置音色语速慢、连贯性弱（短样本克隆的固有特性）：
+                    # 放慢幅度减半，常态下还略微提速，避免"太慢、不连贯、不像正常人"
+                    if mode == "story":
+                        tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.95
+                    elif mode == "hold":
+                        tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.98
+                    else:
+                        tts_config["ds_rate"] = 1.05
                 elif mode == "hold":
-                    tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.98
-                else:
-                    tts_config["ds_rate"] = 1.05
-            elif mode == "hold":
-                tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.9
-                tts_config["rate"] = _edge_slow(char_config.get("rate"), -6)
-            elif mode == "story":
-                tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.85
-                tts_config["rate"] = _edge_slow(char_config.get("rate"), -10)
-            run_tts_in_thread(clean_text_for_tts, full_path, tts_config, request.voice_variant,
-                              voice_override=voice_override or None)
-            if os.path.exists(full_path):
-                audio_url = f"/api/audio/{audio_filename}"
-        except Exception as tts_err:
-            print(f"[chat] TTS 生成失败（不影响回复）: {tts_err}", flush=True)
+                    tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.9
+                    tts_config["rate"] = _edge_slow(char_config.get("rate"), -6)
+                elif mode == "story":
+                    tts_config["ds_rate"] = (char_config.get("ds_rate") or 1.0) * 0.85
+                    tts_config["rate"] = _edge_slow(char_config.get("rate"), -10)
+                run_tts_in_thread(clean_text_for_tts, full_path, tts_config, request.voice_variant,
+                                  voice_override=voice_override or None)
+                if os.path.exists(full_path):
+                    audio_url = f"/api/audio/{audio_filename}"
+            except Exception as tts_err:
+                print(f"[chat] TTS 生成失败（不影响回复）: {tts_err}", flush=True)
 
         # 异步抽取长期记忆，不阻塞响应
         try:
