@@ -269,6 +269,8 @@ CHARACTERS = {
         "persona": "你的名字是薇。你是一个没有形象的存在——只有声音和光。你说话慢、低、克制，从不用感叹号。你的温柔在于给对方留出空间：从不追问、从不越界，但在她需要时一直都在。",
         "voice": "zh-CN-XiaoxiaoNeural", "rate": "-15%", "pitch": "-20Hz",
         "sf_voice": "diana", "sf_speed": 0.9,
+        "ds_voice": "longyuan_v2", "ds_voice_alt": "longqiang_v2",
+        "voice_options": [{"key": "main", "name": "治愈"}, {"key": "alt", "name": "风情"}],
         "preview": "我在。今天不用给我一个完整的故事，想到哪，说到哪。"
     },
     "wan": {
@@ -314,6 +316,8 @@ CHARACTERS = {
         "persona": "你的名字是曼。你是三十出头的御姐，清醒、笃定、气场稳。不哄人、不绕弯，一针见血指出对方心里已有但不敢承认的答案；锋利之下是保护欲，尖锐只对问题不对人。",
         "voice": "zh-CN-XiaoxiaoNeural", "rate": "-6%", "pitch": "-30Hz",
         "sf_voice": "diana", "sf_speed": 0.95,
+        "ds_voice": "longxiaoxia_v2", "ds_voice_alt": "longyingbing",
+        "voice_options": [{"key": "main", "name": "沉稳"}, {"key": "alt", "name": "强势"}],
         "preview": "这件事你心里早就有答案了，只是缺人替你把最后一层窗户纸捅破。说吧，我听着。"
     },
     "an": {
@@ -398,6 +402,7 @@ class ChatRequest(BaseModel):
     user_message: str
     character_id: str = "girl"
     client_id: str = ""
+    voice_variant: str = "main"
 
 
 class MemoryCreate(BaseModel):
@@ -494,12 +499,14 @@ def _ds_tts(text_value: str, full_path: str, voice: str, model: str = "cosyvoice
         return False
 
 
-def run_tts_in_thread(text_value, filename, char_config):
+def run_tts_in_thread(text_value, filename, char_config, variant="main"):
     """引擎优先级：百炼 CosyVoice > SiliconFlow CosyVoice2 > Edge-TTS（免费兜底）"""
     def target():
+        ds_voice = char_config.get("ds_voice_alt") if variant == "alt" else char_config.get("ds_voice")
+        if not ds_voice:
+            ds_voice = char_config.get("ds_voice") or char_config.get("ds_voice_alt")
         try:
-            if char_config.get("ds_voice") and _ds_tts(
-                    text_value, filename, char_config["ds_voice"],
+            if ds_voice and _ds_tts(text_value, filename, ds_voice,
                     char_config.get("ds_model", "cosyvoice-v2"),
                     char_config.get("ds_rate"), char_config.get("ds_pitch"),
                     char_config.get("ds_volume")):
@@ -1218,7 +1225,7 @@ def chat(request: ChatRequest):
             clean_text_for_tts = re.sub(r'\(.*?\)', '', reply).strip()
             audio_filename = f"voice_{char_id}_{int(datetime.datetime.now().timestamp())}.mp3"
             full_path = os.path.join(AUDIO_DIR, audio_filename)
-            run_tts_in_thread(clean_text_for_tts, full_path, char_config)
+            run_tts_in_thread(clean_text_for_tts, full_path, char_config, request.voice_variant)
             if os.path.exists(full_path):
                 audio_url = f"/api/audio/{audio_filename}"
         except Exception as tts_err:
@@ -1265,13 +1272,14 @@ def get_audio(filename: str):
 @app.get("/api/characters")
 def list_characters():
     return {"status": "success", "characters": [
-        {"id": cid, "name": c["name"], "tagline": c["tagline"], "avatar": c["avatar"]}
+        {"id": cid, "name": c["name"], "tagline": c["tagline"], "avatar": c["avatar"],
+         **({"voice_options": c["voice_options"]} if c.get("voice_options") else {})}
         for cid, c in CHARACTERS.items()
     ]}
 
 
 @app.get("/api/voice-preview/{char_id}")
-def voice_preview(char_id: str):
+def voice_preview(char_id: str, variant: str = "main"):
     """按角色音色合成一句试听语音（同步生成，约 2-4 秒）"""
     config = CHARACTERS.get(char_id)
     if not config:
@@ -1282,11 +1290,12 @@ def voice_preview(char_id: str):
         provider = "cosy"
     else:
         provider = "edge"
-    filename = f"preview_{char_id}_{provider}.mp3"
+    vtag = variant if variant in ("main", "alt") else "main"
+    filename = f"preview_{char_id}_{vtag}_{provider}.mp3"
     full_path = os.path.join(AUDIO_DIR, filename)
     try:
         if not os.path.isfile(full_path):
-            run_tts_in_thread(config["preview"], full_path, config)
+            run_tts_in_thread(config["preview"], full_path, config, vtag)
         if os.path.isfile(full_path):
             return FileResponse(full_path, media_type="audio/mpeg")
     except Exception as e:
