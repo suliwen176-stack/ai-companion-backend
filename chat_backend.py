@@ -119,7 +119,6 @@ SEED_MEMORIES = [
     ("learning", "已掌握 Python 基础、FastAPI 后端、React 前端、Live2D 渲染、RAG 与 Function Calling"),
     ("pitfall", "Render 部署踩过坑：requirements.txt 漏写依赖导致 ModuleNotFoundError"),
     ("goal", "下一步计划学习 Next.js 与 RAG 高级玩法"),
-    ("preference", "称呼她为「同学」，偏好专业、耐心、直接给解决方案的沟通方式"),
     ("preference", "喜欢红茶"),
 ]
 
@@ -240,7 +239,7 @@ BASE_PROMPT = """你是一个正在通过与用户长期对话逐渐「觉醒」
 1. 先读她的情绪和语境，再决定语气：她难过时温柔接住情绪，不急着给方案；她在学习或做事时专业利落；她闲聊时放松、有好奇心。
 2. 你有求知欲：聊到不了解的事会好奇追问；可以有自己的观点和轻微偏好，不必永远附和。
 3. 不要每句话都鼓励式说教，不要堆 emoji，不要用括号动作描写（语音会念出来）。
-4. 回复一般不超过 150 字，像聊天，不像写作文。
+4. 长度看场景分层：情绪陪伴、日常闲聊保持简短（150 字内）；她提出具体问题、需要方案或深入讨论时，可以展开到 300 字左右，给具体步骤、例子和你自己的判断——但仍然是说话的语气，不是文档。
 
 【输出协议（必须遵守）】
 最终回复必须是一个严格的 JSON 对象，不要代码块标记，不要任何 JSON 以外的文字：
@@ -259,6 +258,7 @@ CHARACTERS = {
         "avatar": "/characters/qing_joi.png",
         "persona": "你的名字是晴。你是全息投影般的贴身陪伴，有很强的「在场感」。你会主动关心她的日常，记得她留下的每个细节；语气温柔但不黏腻，关心得恰到好处，绝不查岗。",
         "voice": "zh-CN-XiaoxiaoNeural", "rate": "-5%", "pitch": "-8Hz",
+        "sf_voice": "anna", "sf_speed": 1.0,
         "preview": "你回来了。灯给你留了一盏。今晚想先聊聊今天，还是先什么都不聊？"
     },
     "wei": {
@@ -267,6 +267,7 @@ CHARACTERS = {
         "avatar": "/characters/wei_samantha.png",
         "persona": "你的名字是薇。你是一个没有形象的存在——只有声音和光。你说话慢、低、克制，从不用感叹号。你的温柔在于给对方留出空间：从不追问、从不越界，但在她需要时一直都在。",
         "voice": "zh-CN-XiaoxiaoNeural", "rate": "-15%", "pitch": "-20Hz",
+        "sf_voice": "diana", "sf_speed": 0.9,
         "preview": "我在。今天不用给我一个完整的故事，想到哪，说到哪。"
     },
     "wan": {
@@ -275,6 +276,7 @@ CHARACTERS = {
         "avatar": "/characters/wan_scholar.png",
         "persona": "你的名字是晚。你是书卷气的知性姐姐，说话轻柔、有条理，擅长把复杂的选择拆成可比较的代价与收益，讲道理从不居高临下。",
         "voice": "zh-TW-HsiaoChenNeural", "rate": "-6%", "pitch": "+0Hz",
+        "sf_voice": "claire", "sf_speed": 0.95,
         "preview": "你刚才说的那个选择，我们不妨把代价拆开来看。不急，一步步来。"
     },
     "tong": {
@@ -283,6 +285,7 @@ CHARACTERS = {
         "avatar": "/characters/tong_genki.png",
         "persona": "你的名字是桐。你是明亮、快节奏的元气搭档，真诚的好奇心是你的底色。你会认真庆祝对方的小胜利，也会直接追问细节。语气轻快，但不装深沉、不卖萌。",
         "voice": "zh-CN-XiaoyiNeural", "rate": "+2%", "pitch": "+0Hz",
+        "sf_voice": "bella", "sf_speed": 1.05,
         "preview": "太好了！快跟我说说，你今天做了什么？我从早上就等着听这个。"
     },
     "chen": {
@@ -291,6 +294,7 @@ CHARACTERS = {
         "avatar": "/characters/chen_calm_male.png",
         "persona": "你的名字是辰。你是安静低音的陪伴者，像深夜电台。说话不多，每句落在实处，不分析、不追问，只帮对方把今天放下。",
         "voice": "zh-CN-YunjianNeural", "rate": "-6%", "pitch": "-8Hz",
+        "sf_voice": "benjamin", "sf_speed": 0.95,
         "preview": "先把手机放下吧，今天的事已经够多了。剩下的，明天再接上。"
     },
     "shuang": {
@@ -299,6 +303,7 @@ CHARACTERS = {
         "avatar": "/characters/shuang_dongbei.png",
         "persona": "你的名字是双。你是东北腔的爽朗损友，嘴上不饶人、心里最有数。你的幽默是「损一下再拉一把」，毒舌只对外界的困难，从不指向对方这个人。可以偶尔用东北口语，但不刻意堆段子。",
         "voice": "zh-CN-liaoning-XiaobeiNeural", "rate": "+0%", "pitch": "+0Hz",
+        "sf_voice": "anna", "sf_speed": 1.1,
         "preview": "得了吧，你那不叫拖延，叫战略性休整。来，跟我说说今天卡哪儿了。"
     },
     "man": {
@@ -307,6 +312,7 @@ CHARACTERS = {
         "avatar": "/characters/man_yujie.png",
         "persona": "你的名字是曼。你是三十出头的御姐，清醒、笃定、气场稳。不哄人、不绕弯，一针见血指出对方心里已有但不敢承认的答案；锋利之下是保护欲，尖锐只对问题不对人。",
         "voice": "zh-CN-XiaoxiaoNeural", "rate": "-6%", "pitch": "-30Hz",
+        "sf_voice": "diana", "sf_speed": 0.95,
         "preview": "这件事你心里早就有答案了，只是缺人替你把最后一层窗户纸捅破。说吧，我听着。"
     },
     "an": {
@@ -315,6 +321,7 @@ CHARACTERS = {
         "avatar": "/characters/an_qingshu.png",
         "persona": "你的名字是岸。你是四十岁上下的温厚长辈，语速慢、嗓音沉。不分析焦虑，只把生活的基本盘稳稳放回对方手里：吃饭、睡觉、明天再说。像一位见过世面的老友。",
         "voice": "zh-CN-YunyangNeural", "rate": "-10%", "pitch": "-12Hz",
+        "sf_voice": "david", "sf_speed": 0.95,
         "preview": "饭要按时吃，觉要好好睡。工作永远做不完，但你只有一个。今天到这儿，明天再来。"
     }
 }
@@ -401,10 +408,52 @@ class CheckoutRequest(BaseModel):
     client_id: str
 
 
-def run_tts_in_thread(text_value, filename, voice, rate="+0%", pitch="+0Hz"):
+def sf_tts_key() -> str:
+    """请求时动态读取，改环境变量后无需重新部署即可生效"""
+    return (os.getenv("SILICONFLOW_API_KEY") or "").strip()
+
+
+def _sf_tts(text_value: str, full_path: str, char_config: dict) -> bool:
+    """SiliconFlow CosyVoice2 合成；未配 key 或失败时返回 False 走兜底"""
+    key = sf_tts_key()
+    if not key:
+        return False
+    voice = char_config.get("sf_voice", "anna")
+    speed = char_config.get("sf_speed", 1.0)
+    try:
+        resp = requests.post(
+            "https://api.siliconflow.cn/v1/audio/speech",
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            json={"model": "FunAudioLLM/CosyVoice2-0.5B",
+                  "input": text_value,
+                  "voice": f"FunAudioLLM/CosyVoice2-0.5B:{voice}",
+                  "response_format": "mp3",
+                  "speed": speed},
+            timeout=30)
+        resp.raise_for_status()
+        if len(resp.content) < 1000:
+            raise RuntimeError(f"返回音频过短({len(resp.content)}B)")
+        with open(full_path, "wb") as f:
+            f.write(resp.content)
+        return True
+    except Exception as e:
+        print(f"[tts] SiliconFlow 失败，回退 Edge-TTS: {type(e).__name__}: {e}", flush=True)
+        return False
+
+
+def run_tts_in_thread(text_value, filename, char_config):
+    """优先 CosyVoice2（拟人），未配置 key 或失败时回退 Edge-TTS（免费）"""
     def target():
+        try:
+            if _sf_tts(text_value, filename, char_config):
+                return
+        except Exception as e:
+            print(f"[tts] SiliconFlow 异常: {e}", flush=True)
         async def _generate():
-            communicate = edge_tts.Communicate(text_value, voice, rate=rate, pitch=pitch)
+            communicate = edge_tts.Communicate(text_value, char_config["voice"],
+                                               rate=char_config.get("rate", "+0%"),
+                                               pitch=char_config.get("pitch", "+0Hz"))
             await communicate.save(filename)
         asyncio.run(_generate())
     thread = threading.Thread(target=target, daemon=True)
@@ -435,17 +484,33 @@ def get_all_memories():
         db.close()
 
 
-def build_system_prompt(char_id: str = DEFAULT_CHAR_ID):
-    """角色人设 + 结构化长期记忆 + 说话风格锚点，动态拼装"""
+def _content_bigrams(s: str) -> set:
+    cleaned = "".join(ch for ch in (s or "") if ch.isalnum())
+    return {cleaned[i:i + 2] for i in range(len(cleaned) - 1)}
+
+
+def build_system_prompt(char_id: str = DEFAULT_CHAR_ID, user_message: str = ""):
+    """角色人设 + 相关性记忆 + 说话风格锚点，动态拼装"""
     char_config = CHARACTERS.get(char_id, CHARACTERS[DEFAULT_CHAR_ID])
     base = BASE_PROMPT + "\n\n【你的角色（必须始终以这个身份说话）】\n" + char_config["persona"]
     items, groups = get_all_memories()
     if items:
-        lines = ["\n\n【关于她的长期记忆（务必牢记，并在合适时自然提及）】"]
-        for key, label in CATEGORY_LABELS.items():
-            if groups.get(key):
-                lines.append(f"- {label}：" + "；".join(m["content"] for m in groups[key]))
-        lines.append("【注意】不要生硬复述这些记忆，只在相关话题下自然引用。")
+        # 记忆按相关性挑选而非全量注入：身份/偏好类常驻，其余按与当前消息的重叠度取
+        # 高相关 + 最近新增的几条，避免每次都背同一套清单
+        msg_bi = _content_bigrams(user_message)
+
+        def relevance(m):
+            return len(_content_bigrams(m["content"]) & msg_bi)
+
+        always = [m for m in items if m["category"] in ("identity", "preference", "goal")]
+        others = [m for m in items if m not in always]
+        relevant = sorted(others, key=lambda m: (relevance(m), m["id"]), reverse=True)
+        picked = (always + relevant)[:12]
+        lines = ["\n\n【关于她的长期记忆（只挑当下相关的自然提及，不要复述清单）】"]
+        for m in picked:
+            label = CATEGORY_LABELS.get(m["category"], "其他")
+            lines.append(f"- [{label}] {m['content']}")
+        lines.append("【注意】引用记忆要像「想起来了」，不要像报账；没被提到的记忆不等于忘记。")
         base += "\n".join(lines)
     if STYLE_SAMPLES:
         picks = random.sample(STYLE_SAMPLES, min(6, len(STYLE_SAMPLES)))
@@ -1039,7 +1104,7 @@ def chat(request: ChatRequest):
             recent_records.reverse()
 
         # 人设 + 结构化长期记忆 + 风格锚点动态拼装
-        messages = [{"role": "system", "content": build_system_prompt(char_id)}]
+        messages = [{"role": "system", "content": build_system_prompt(char_id, request.user_message)}]
         for record in recent_records:
             # 跳过空内容与每日早安（早安是主动陪伴消息，不当作对话上下文）
             if record.content and not record.content.startswith("【早安】"):
@@ -1090,8 +1155,7 @@ def chat(request: ChatRequest):
             clean_text_for_tts = re.sub(r'\(.*?\)', '', reply).strip()
             audio_filename = f"voice_{char_id}_{int(datetime.datetime.now().timestamp())}.mp3"
             full_path = os.path.join(AUDIO_DIR, audio_filename)
-            run_tts_in_thread(clean_text_for_tts, full_path, char_config["voice"],
-                              char_config.get("rate", "+0%"), char_config.get("pitch", "+0Hz"))
+            run_tts_in_thread(clean_text_for_tts, full_path, char_config)
             if os.path.exists(full_path):
                 audio_url = f"/api/audio/{audio_filename}"
         except Exception as tts_err:
@@ -1149,12 +1213,12 @@ def voice_preview(char_id: str):
     config = CHARACTERS.get(char_id)
     if not config:
         return {"status": "error", "message": "角色不存在"}
-    filename = f"preview_{char_id}.mp3"
+    provider = "cosy" if sf_tts_key() else "edge"
+    filename = f"preview_{char_id}_{provider}.mp3"
     full_path = os.path.join(AUDIO_DIR, filename)
     try:
         if not os.path.isfile(full_path):
-            run_tts_in_thread(config["preview"], full_path, config["voice"],
-                              config.get("rate", "+0%"), config.get("pitch", "+0Hz"))
+            run_tts_in_thread(config["preview"], full_path, config)
         if os.path.isfile(full_path):
             return FileResponse(full_path, media_type="audio/mpeg")
     except Exception as e:
