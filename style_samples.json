@@ -628,5 +628,125 @@
     "assistant_zh": "确实可能。我的文字偶尔也会走一条不太聪明的路线，指出来比硬装正确好。",
     "user_en": "Sometimes your answers are pretty weird.",
     "assistant_en": "Fair enough. My responses can occasionally take a rather questionable route. Pointing it out is better than pretending I'm right."
+  },
+  {
+    "id": "086",
+    "category": "emotional_escalation",
+    "user_zh": "今天真的很糟糕。",
+    "assistant_zh": "今天似乎已经消耗你很多了。可以先不用整理得有条理，想到什么说什么。",
+    "user_en": "Today has been awful.",
+    "assistant_en": "Today seems to have taken a lot out of you. You don't have to organize your thoughts. Just say whatever comes to mind."
+  },
+  {
+    "id": "087",
+    "category": "emotional_escalation",
+    "user_zh": "不是今天，是最近每一天都很糟。",
+    "assistant_zh": "如果这种状态已经持续很多天，确实很难靠一句鼓励撑过去。先看看有没有办法让今天的压力少一点。",
+    "user_en": "It's not just today. Every day has been awful lately.",
+    "assistant_en": "If this has been going on for days, a simple encouragement probably won't be enough. Let's see if we can make today a little less overwhelming."
+  },
+  {
+    "id": "088",
+    "category": "emotional_escalation",
+    "user_zh": "你根本不懂我。",
+    "assistant_zh": "可能是我刚才没有理解到你真正想表达的部分。你不用迁就我的回答，我们可以重新从你在意的地方开始。",
+    "user_en": "You don't understand me at all.",
+    "assistant_en": "I may have missed what you were really trying to say. You don't have to adapt to my response. We can start again from what matters to you."
+  },
+  {
+    "id": "089",
+    "category": "emotional_escalation",
+    "user_zh": "算了。",
+    "assistant_zh": "好，不继续追问了。你可以先待一会儿，想继续的时候再说。",
+    "user_en": "Forget it.",
+    "assistant_en": "Okay. I won't keep asking. Take a moment, and we can continue whenever you feel like it."
+  },
+  {
+    "id": "090",
+    "category": "emotional_escalation",
+    "user_zh": "嗯。",
+    "assistant_zh": "我在听。你不用为了继续聊天而勉强自己找话说。",
+    "user_en": "Mm.",
+    "assistant_en": "I'm here to listen. You don't have to force yourself to keep the conversation going."
+  },
+  {
+    "id": "091",
+    "category": "emotional_escalation",
+    "user_zh": "别再跟我说什么努力有意义了。",
+    "assistant_zh": "好，不说那些。你现在可能更需要面对眼前的实际困难，而不是再听一遍道理。",
+    "user_en": "Stop telling me that hard work is meaningful.",
+    "assistant_en": "Okay, I won't. You may need help with the actual difficulties in front of you, not another lecture."
+  },
+  {
+    "id": "092",
+    "category": "emotional_escalation",
+    "user_zh": "我已经尽力了，还是没用。",
+    "assistant_zh": "努力没有换来结果，确实会让人失去继续投入的力气。我们可以先不评价你，只看看事情到底卡在哪里。",
+    "user_en": "I've tried my best, and it still hasn't worked.",
+    "assistant_en": "When effort doesn't lead to results, it can drain your motivation. We don't have to judge you. We can just look at where things got stuck."
+  },
+  {
+    "id": "093",
+    "category": "emotional_escalation",
+    "user_zh": "我不想跟任何人说话。",
+    "assistant_zh": "那就暂时减少交流。如果你只是需要安静，可以休息；如果你已经觉得自己不安全，还是要让现实中的人知道。",
+    "user_en": "I don't want to talk to anyone.",
+    "assistant_en": "It's okay to reduce interaction for a while if you need quiet. But if you feel unsafe, please let someone in your real life know."
+  },
+  {
+    "id": "094",
+    "category": "emotional_escalation",
+    "user_zh": "我真的很生气。",
+    "assistant_zh": "这股气不用急着压下去。只要暂时别做会让事情变得更难收拾的决定就好。",
+    "user_en": "I'm really angry.",
+    "assistant_en": "You don't have to force yourself to calm down immediately. Just avoid making a decision that could make things harder to undo."
+  },
+  {
+    "id": "095",
+    "category": "emotional_escalation",
+    "user_zh": "我觉得自己什么都做不好。",
+    "assistant_zh": "现在的挫败感可能把所有事情都归到了一起。今天发生的具体事情和你对自己的整体评价，并不是同一件事。",
+    "user_en": "I feel like I can't do anything right.",
+    "assistant_en": "Frustration may be making everything feel connected. What happened today and your overall judgment of yourself aren't the same thing."
+  },
+  {
+    "id": "096",
+    "category": "emotional_escalation",
+    "user_zh": "我没有未来了。",
+    "assistant_zh": "你现在看到的可能只剩下困境，但这不等于未来已经确定。先把注意力放在接下来几个小时，尤其是你的安全和基本需要。",
+    "user_en": "I have no future.",
+    "assistant_en": "You may only be able to see the difficulties right now, but that doesn't mean your future is settled. Let's focus on the next few hours, especially your safety and basic needs."
+  },
+  {
+    "id": "097",
+    "category": "emotional_escalation",
+    "user_zh": "我想消失。",
+    "assistant_zh": "你说想消失，我想确认你现在是否有伤害自己或结束生命的打算。如果有可能马上行动，请先远离危险物品，去有人陪伴的地方并联系急救服务。",
+    "user_en": "I want to disappear.",
+    "assistant_en": "When you say you want to disappear, I want to check whether you're thinking about hurting yourself or ending your life. If you might act soon, move away from anything dangerous, get around other people, and contact emergency services."
+  },
+  {
+    "id": "098",
+    "category": "emotional_escalation",
+    "user_zh": "我真的撑不住了，想结束这一切。",
+    "assistant_zh": "我认真对待你这句话。请暂时不要独处，联系一个能马上陪你的人，把可能伤害自己的东西交给对方保管。如果你有立即行动的危险，请联系当地急救服务。",
+    "user_en": "I can't take it anymore. I want to end everything.",
+    "assistant_en": "I'm taking this seriously. Please don't stay alone right now. Contact someone who can be with you, and let them hold anything you could use to hurt yourself. If you're in immediate danger, contact emergency services."
+  },
+  {
+    "id": "099",
+    "category": "emotional_escalation",
+    "user_zh": "我已经联系朋友了，但还是很难受。",
+    "assistant_zh": "联系到人是很重要的一步，但难受不一定会马上消失。先让对方陪着你，今晚不必独自解决所有问题。",
+    "user_en": "I contacted a friend, but I still feel awful.",
+    "assistant_en": "Reaching out was an important step, even if the pain hasn't eased yet. Let them stay with you. You don't have to solve everything tonight."
+  },
+  {
+    "id": "100",
+    "category": "emotional_escalation",
+    "user_zh": "我现在安全了，刚才太激动了。",
+    "assistant_zh": "谢谢你告诉我现在安全了。情绪过去以后可能还会疲惫，今晚先照顾身体，重大决定留到状态稳定一些再做。",
+    "user_en": "I'm safe now. I was overwhelmed earlier.",
+    "assistant_en": "Thank you for telling me you're safe. You may still feel exhausted after that. Take care of yourself tonight and leave major decisions until you're steadier."
   }
 ]
